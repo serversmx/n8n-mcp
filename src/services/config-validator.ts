@@ -409,6 +409,32 @@ export class ConfigValidator {
           });
         }
       }
+
+      // Static multi-select options (for example, webhook events) need the same membership validation
+      // as a single select. Runtime expressions and dynamically loaded options cannot be checked here.
+      if (prop.type === 'multiOptions' && !(typeof value === 'string' && value.startsWith('='))) {
+        if (!Array.isArray(value)) {
+          errors.push({
+            type: 'invalid_type',
+            property: key,
+            message: `Property '${key}' must be an array of selected options`,
+            fix: `Set ${key} to an array or an expression that returns an array`,
+          });
+        } else if (Array.isArray(prop.options) && prop.options.length > 0 && !prop.typeOptions?.loadOptionsMethod && !prop.typeOptions?.loadOptions) {
+          const validValues = prop.options.map((option: any) => typeof option === 'string' ? option : option.value);
+          const invalidValues = value.filter((selected) =>
+            !(typeof selected === 'string' && selected.startsWith('=')) && !validValues.includes(selected),
+          );
+          if (invalidValues.length > 0) {
+            errors.push({
+              type: 'invalid_value',
+              property: key,
+              message: `Invalid values for '${key}': ${invalidValues.join(', ')}. Must be one of: ${validValues.join(', ')}`,
+              fix: `Change ${key} to an array of valid options`,
+            });
+          }
+        }
+      }
     }
   }
   

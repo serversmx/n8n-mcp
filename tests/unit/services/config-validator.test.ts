@@ -1,5 +1,35 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ConfigValidator } from '@/services/config-validator';
+
+describe('ConfigValidator static multiOptions', () => {
+  const property = { name: 'events', type: 'multiOptions', options: [{ name: 'Created', value: 'created' }, { name: 'Updated', value: 'updated' }] };
+
+  it('rejects unknown selections while accepting declared selections', () => {
+    const invalid = ConfigValidator.validate('nodes-base.test', { events: ['created', 'unknown'] }, [property]);
+    expect(invalid.errors).toContainEqual(expect.objectContaining({ property: 'events', type: 'invalid_value' }));
+    expect(ConfigValidator.validate('nodes-base.test', { events: ['created', 'updated'] }, [property]).errors).toEqual([]);
+  });
+
+  it('requires an array for literal selections', () => {
+    expect(ConfigValidator.validate('nodes-base.test', { events: 'created' }, [property]).errors)
+      .toContainEqual(expect.objectContaining({ property: 'events', type: 'invalid_type' }));
+  });
+
+  it.each([{ events: '={{ $json.events }}' }, { events: ['={{ $json.event }}'] }])('allows runtime expressions: $events', ({ events }) => {
+    expect(ConfigValidator.validate('nodes-base.test', { events }, [property]).errors).toEqual([]);
+  });
+
+  it('does not enforce static membership for dynamically loaded selections', () => {
+    for (const dynamic of [
+      { name: 'events', type: 'multiOptions' },
+      { ...property, options: [] },
+      { ...property, typeOptions: { loadOptionsMethod: 'getEvents' } },
+      { ...property, typeOptions: { loadOptions: { routing: { request: { url: '/events' } } } } },
+    ]) {
+      expect(ConfigValidator.validate('nodes-base.test', { events: ['loaded-at-runtime'] }, [dynamic]).errors).toEqual([]);
+    }
+  });
+});
 import type { ValidationResult, ValidationError, ValidationWarning } from '@/services/config-validator';
 
 // Mock the database

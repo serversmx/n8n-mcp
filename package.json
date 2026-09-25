@@ -19,6 +19,8 @@
     "build:ui": "cd ui-apps && npm install && npm run build",
     "build:all": "npm run build:ui && npm run build",
     "rebuild": "node dist/scripts/rebuild.js",
+    "register:chatwoot": "node dist/scripts/register-chatwoot-nodes.js",
+    "generate:chatwoot-catalog": "ts-node --transpile-only src/scripts/generate-chatwoot-catalog.ts",
     "rebuild:optimized": "node dist/scripts/rebuild-optimized.js",
     "validate": "node dist/scripts/validate.js",
     "test-nodes": "node dist/scripts/test-nodes.js",

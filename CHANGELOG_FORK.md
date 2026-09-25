@@ -9,6 +9,45 @@ Versioning: `v<upstream-version>-chatwoot.<n>` where:
 - `<upstream-version>` is the n8n-mcp version we synced from (e.g., `2.51.1`)
 - `<n>` is the iteration number for fork-specific changes on that base
 
+## [Unreleased] - Chatwoot node 0.9.0
+
+### Changed
+
+- **Chatwoot catalog generated from the node package** (`src/integrations/chatwoot/chatwoot-node-snapshot.json`,
+  `npm run generate:chatwoot-catalog -- --package <built n8n-nodes-chatwoot> --version <x.y.z>`). It now lists
+  all 39 resources and 269 operations of the `@renatoascencio/n8n-nodes-chatwoot` 0.9.0 source worktree with its real
+  properties (the old hand-written list had 27 resources and no operations or parameters), credentials shown per
+  resource, and the author URL `https://github.com/RenatoAscencio`. See
+  [catalog regeneration and provenance](docs/CHATWOOT_CATALOG.md), including the captured source digest,
+  the manifest's pending version bump and `--check` for reproducibility.
+- **AI Agent tool**: the main node sets `usableAsTool`, so the catalog marks it `isAITool` and registers the
+  `@renatoascencio/n8n-nodes-chatwoot.chatwootTool` variant.
+- **Chatwoot Trigger**: events are exactly Chatwoot's `ALLOWED_WEBHOOK_EVENTS` (removed the invalid
+  `conversation_assignee_changed` / `conversation_team_changed`, added typing and inbox events), plus the manual
+  (agent bot / API channel) source, filters and options. Webhook payload shapes of Chatwoot 4.18 are documented
+  in `get_node` docs.
+- **Workflow templates**: fixed payload paths (`$json.name` for `contact_created`, conversation display id for
+  `conversation_created`), parameter names (`options.message_type`/`options.private`,
+  `additionalFields.name`/`email`, `assignmentType`), the online-agent filter (`availability_status === 'online'`),
+  the send-message webhook response mode, and removed the empty trigger `webhookId` (every import shared one
+  webhook path). New template `chatwoot-ai-agent` (Chatwoot Tool on an AI Agent), restricted to pending
+  conversations so it stops replying after handing off to a human.
+- **Template checker** (`template-validator.ts`): validates Chatwoot parameters, trigger events and payload paths
+  of any workflow against the catalog; `chatwoot_doctor` uses it instead of expecting exactly 5 templates.
+- **Installation guide**: env-managed install (`N8N_COMMUNITY_PACKAGES_MANAGED_BY_ENV` + `N8N_COMMUNITY_PACKAGES`),
+  n8n 3.0 `N8N_UNVERIFIED_PACKAGES_ENABLED=true`; `N8N_CUSTOM_EXTENSIONS` takes directories, not package names.
+- **Connection validator / `chatwoot_doctor`**: agent bot tokens, Public API (inbox identifier), Platform API
+  inputs, Chatwoot error texts, catalog version and an n8n 3.x advisory. Failed probes and credential lookups
+  make the summary unhealthy; supplied tokens are redacted from messages. Credential presence is explicitly
+  distinguished from verified installation. Bot probes require Chatwoot's resource-not-found response.
+- **Workflow validation**: applies defaults only from visible properties and checks static multi-select
+  values, preventing missing Chatwoot search queries and invalid trigger events from passing validation.
+  Removed obsolete `N8N_COMMUNITY_PACKAGES_ALLOW_TOOL_USAGE` guidance.
+- `npm run register:chatwoot` atomically refreshes Chatwoot nodes in an existing `data/nodes.db`, preserving
+  fetched documentation and rolling back on failure.
+
+---
+
 ## [v2.51.1-chatwoot.1] - 2026-05-06
 
 ### Synced from upstream (v2.35.4 → v2.51.1, 83 commits)
@@ -59,7 +98,7 @@ Initial Chatwoot integration baseline. See git history for details.
 
 1. Sync with upstream: `git fetch upstream && git merge upstream/main`
 2. Resolve conflicts (preserve fork-specific files)
-3. Re-register Chatwoot nodes if `data/nodes.db` was overwritten
+3. Re-register Chatwoot nodes if `data/nodes.db` was overwritten (`npm run build && npm run register:chatwoot`)
 4. Run `npm run build` and chatwoot tests
 5. Tag as `v<new-upstream>-chatwoot.<next-n>`
 6. Add entry to this file
