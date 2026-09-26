@@ -39,7 +39,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: [self-hosted, linux, X64, node20, docker]
+    runs-on: ubuntu-latest
     timeout-minutes: 15  # Increased from 10 to accommodate larger database with community nodes
     steps:
       - uses: actions/checkout@v4
@@ -252,7 +252,7 @@ jobs:
   # Publish test results as checks
   publish-results:
     needs: test
-    runs-on: [self-hosted, linux, X64, node20, docker]
+    runs-on: ubuntu-latest
     if: always()
     permissions:
       checks: write

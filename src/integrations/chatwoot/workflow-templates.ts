@@ -1,19 +1,35 @@
 /**
  * Chatwoot Workflow Templates for n8n
  *
- * Ready-to-use workflow JSON templates using @renatoascencio/n8n-nodes-chatwoot.
+ * Ready-to-use workflow JSON templates using @renatoascencio/n8n-nodes-chatwoot (0.9.x).
  * These templates can be imported directly into n8n via the API or UI.
+ *
+ * Chatwoot parameters and direct trigger payload references are checked by validateChatwootWorkflow
+ * (template-validator.ts) against the node catalog and the Chatwoot 4.18 webhook payloads:
+ * - trigger items are the Chatwoot payload itself, flat: contact_created → `$json.name`,
+ *   conversation_created → `$json.id` (display ID), message_created → `$json.conversation.id`;
+ * - optional values live in collections: Message > Create reads `options.message_type`, Public Contact >
+ *   Create reads `additionalFields.name`.
+ *
+ * Trigger nodes carry no `webhookId`: n8n then derives a per-workflow webhook path. A fixed or empty
+ * webhookId would make every workflow imported from the same template share one path.
  */
 
 export interface ChatwootWorkflowTemplate {
   id: string;
   name: string;
   description: string;
-  category: 'contact-sync' | 'messaging' | 'monitoring' | 'automation';
+  category: 'contact-sync' | 'messaging' | 'monitoring' | 'automation' | 'ai';
   difficulty: 'beginner' | 'intermediate' | 'advanced';
   requiredCredential: 'chatwootApi' | 'chatwootPlatformApi' | 'chatwootPublicApi';
   workflow: Record<string, unknown>;
 }
+
+const CHATWOOT = '@renatoascencio/n8n-nodes-chatwoot.chatwoot';
+const CHATWOOT_TOOL = '@renatoascencio/n8n-nodes-chatwoot.chatwootTool';
+const CHATWOOT_TRIGGER = '@renatoascencio/n8n-nodes-chatwoot.chatwootTrigger';
+const CHATWOOT_API_CREDENTIAL = { chatwootApi: { id: '', name: 'Chatwoot API' } };
+const CHATWOOT_PUBLIC_API_CREDENTIAL = { chatwootPublicApi: { id: '', name: 'Chatwoot Public API' } };
 
 export const CHATWOOT_WORKFLOW_TEMPLATES: ChatwootWorkflowTemplate[] = [
   // =========================================================================
@@ -22,7 +38,7 @@ export const CHATWOOT_WORKFLOW_TEMPLATES: ChatwootWorkflowTemplate[] = [
   {
     id: 'chatwoot-list-conversations',
     name: 'Chatwoot: List Open Conversations',
-    description: 'Fetches all open conversations from Chatwoot on a schedule. Useful for monitoring and reporting.',
+    description: 'Fetches open conversations from Chatwoot every hour. Useful for monitoring and reporting.',
     category: 'monitoring',
     difficulty: 'beginner',
     requiredCredential: 'chatwootApi',
@@ -45,10 +61,10 @@ export const CHATWOOT_WORKFLOW_TEMPLATES: ChatwootWorkflowTemplate[] = [
             filters: { status: 'open' },
           },
           name: 'Get Open Conversations',
-          type: '@renatoascencio/n8n-nodes-chatwoot.chatwoot',
+          type: CHATWOOT,
           typeVersion: 1,
           position: [470, 300],
-          credentials: { chatwootApi: { id: '', name: 'Chatwoot API' } },
+          credentials: CHATWOOT_API_CREDENTIAL,
         },
       ],
       connections: {
@@ -62,31 +78,35 @@ export const CHATWOOT_WORKFLOW_TEMPLATES: ChatwootWorkflowTemplate[] = [
   // =========================================================================
   {
     id: 'chatwoot-contact-sync',
-    name: 'Chatwoot: Contact Sync to Google Sheets',
-    description: 'When a new contact is created in Chatwoot (via webhook), adds their info to a Google Sheet for CRM tracking.',
+    name: 'Chatwoot: New Contact Sync',
+    description:
+      'When a contact is created in Chatwoot (contact_created webhook), extracts its id, name, email, phone and identifier, ' +
+      'ready for a CRM or Google Sheets node. Add your destination node after "Extract Contact Data".',
     category: 'contact-sync',
     difficulty: 'intermediate',
     requiredCredential: 'chatwootApi',
     workflow: {
-      name: 'Chatwoot - Contact Sync to Sheets',
+      name: 'Chatwoot - New Contact Sync',
       nodes: [
         {
-          parameters: { events: ['contact_created'] },
+          parameters: { source: 'accountWebhook', events: ['contact_created'] },
           name: 'Chatwoot Trigger',
-          type: '@renatoascencio/n8n-nodes-chatwoot.chatwootTrigger',
+          type: CHATWOOT_TRIGGER,
           typeVersion: 1,
           position: [250, 300],
-          credentials: { chatwootApi: { id: '', name: 'Chatwoot API' } },
-          webhookId: '',
+          credentials: CHATWOOT_API_CREDENTIAL,
         },
         {
           parameters: {
             mode: 'manual',
             assignments: {
+              // contact_created is Contact#webhook_data, flat: no `contact` wrapper
               assignments: [
-                { name: 'name', type: 'string', value: '={{ $json.contact?.name || "Unknown" }}' },
-                { name: 'email', type: 'string', value: '={{ $json.contact?.email || "" }}' },
-                { name: 'phone', type: 'string', value: '={{ $json.contact?.phone_number || "" }}' },
+                { name: 'contact_id', type: 'number', value: '={{ $json.id }}' },
+                { name: 'name', type: 'string', value: '={{ $json.name || "Unknown" }}' },
+                { name: 'email', type: 'string', value: '={{ $json.email || "" }}' },
+                { name: 'phone', type: 'string', value: '={{ $json.phone_number || "" }}' },
+                { name: 'identifier', type: 'string', value: '={{ $json.identifier || "" }}' },
                 { name: 'source', type: 'string', value: 'chatwoot' },
                 { name: 'created_at', type: 'string', value: '={{ $now.toISO() }}' },
               ],
@@ -110,7 +130,9 @@ export const CHATWOOT_WORKFLOW_TEMPLATES: ChatwootWorkflowTemplate[] = [
   {
     id: 'chatwoot-send-message',
     name: 'Chatwoot: Send Message to Conversation',
-    description: 'Sends an outgoing message to a specific Chatwoot conversation. Triggered by webhook or manual input.',
+    description:
+      'Webhook endpoint that sends an outgoing message to a Chatwoot conversation. ' +
+      'POST {"conversation_id": <display id>, "message": "..."}.',
     category: 'messaging',
     difficulty: 'beginner',
     requiredCredential: 'chatwootApi',
@@ -118,11 +140,13 @@ export const CHATWOOT_WORKFLOW_TEMPLATES: ChatwootWorkflowTemplate[] = [
       name: 'Chatwoot - Send Message',
       nodes: [
         {
-          parameters: { httpMethod: 'POST', path: 'send-chatwoot-message' },
+          // Answered by the "Respond" node, which also runs when Chatwoot rejects the message
+          parameters: { httpMethod: 'POST', path: 'send-chatwoot-message', responseMode: 'responseNode' },
           name: 'Webhook',
           type: 'n8n-nodes-base.webhook',
           typeVersion: 2,
           position: [250, 300],
+          onError: 'continueRegularOutput',
         },
         {
           parameters: {
@@ -130,17 +154,23 @@ export const CHATWOOT_WORKFLOW_TEMPLATES: ChatwootWorkflowTemplate[] = [
             operation: 'create',
             conversationId: '={{ $json.body.conversation_id }}',
             content: '={{ $json.body.message }}',
-            messageType: 'outgoing',
-            private: false,
+            // Message > Create reads message_type / private from the Options collection
+            options: { message_type: 'outgoing', private: false },
           },
           name: 'Send Message',
-          type: '@renatoascencio/n8n-nodes-chatwoot.chatwoot',
+          type: CHATWOOT,
           typeVersion: 1,
           position: [470, 300],
-          credentials: { chatwootApi: { id: '', name: 'Chatwoot API' } },
+          credentials: CHATWOOT_API_CREDENTIAL,
+          // On failure the node outputs { error, description, httpCode } instead of stopping
+          onError: 'continueRegularOutput',
         },
         {
-          parameters: { respondWith: 'json', responseBody: '={{ JSON.stringify({ success: true }) }}' },
+          parameters: {
+            respondWith: 'json',
+            responseBody:
+              '={{ JSON.stringify($json.error ? { success: false, error: $json.error } : { success: true, message_id: $json.id }) }}',
+          },
           name: 'Respond',
           type: 'n8n-nodes-base.respondToWebhook',
           typeVersion: 1.1,
@@ -160,7 +190,9 @@ export const CHATWOOT_WORKFLOW_TEMPLATES: ChatwootWorkflowTemplate[] = [
   {
     id: 'chatwoot-auto-assign',
     name: 'Chatwoot: Auto-Assign New Conversations',
-    description: 'Automatically assigns new conversations to available agents based on team or round-robin logic.',
+    description:
+      'Assigns each new, unassigned conversation to a random online agent (conversation_created webhook). ' +
+      'Nothing happens when no agent is online.',
     category: 'automation',
     difficulty: 'intermediate',
     requiredCredential: 'chatwootApi',
@@ -168,30 +200,32 @@ export const CHATWOOT_WORKFLOW_TEMPLATES: ChatwootWorkflowTemplate[] = [
       name: 'Chatwoot - Auto-Assign Conversations',
       nodes: [
         {
-          parameters: { events: ['conversation_created'] },
+          parameters: { source: 'accountWebhook', events: ['conversation_created'] },
           name: 'Chatwoot Trigger',
-          type: '@renatoascencio/n8n-nodes-chatwoot.chatwootTrigger',
+          type: CHATWOOT_TRIGGER,
           typeVersion: 1,
           position: [250, 300],
-          credentials: { chatwootApi: { id: '', name: 'Chatwoot API' } },
+          credentials: CHATWOOT_API_CREDENTIAL,
         },
         {
           parameters: { resource: 'agent', operation: 'getAll' },
-          name: 'Get Available Agents',
-          type: '@renatoascencio/n8n-nodes-chatwoot.chatwoot',
+          name: 'Get Agents',
+          type: CHATWOOT,
           typeVersion: 1,
           position: [470, 300],
-          credentials: { chatwootApi: { id: '', name: 'Chatwoot API' } },
+          credentials: CHATWOOT_API_CREDENTIAL,
         },
         {
           parameters: {
-            jsCode: `// Filter to online agents and pick one randomly
-const agents = $input.all().filter(a => a.json.availability_status === 'available');
-if (agents.length === 0) return [{ json: { agent_id: null } }];
-const selected = agents[Math.floor(Math.random() * agents.length)];
-return [{ json: { agent_id: selected.json.id } }];`,
+            jsCode: `// conversation_created is the conversation itself: id = display ID, meta.assignee = current assignee
+if ($('Chatwoot Trigger').first().json.meta?.assignee) return [];
+// Chatwoot availability_status is 'online', 'busy' or 'offline'
+const online = $input.all().filter((agent) => agent.json.availability_status === 'online');
+if (online.length === 0) return [];
+const selected = online[Math.floor(Math.random() * online.length)];
+return [{ json: { conversation_id: $('Chatwoot Trigger').first().json.id, agent_id: selected.json.id } }];`,
           },
-          name: 'Select Agent',
+          name: 'Select Online Agent',
           type: 'n8n-nodes-base.code',
           typeVersion: 2,
           position: [690, 300],
@@ -200,20 +234,21 @@ return [{ json: { agent_id: selected.json.id } }];`,
           parameters: {
             resource: 'conversation',
             operation: 'assign',
-            conversationId: '={{ $("Chatwoot Trigger").item.json.conversation?.id }}',
+            conversationId: '={{ $json.conversation_id }}',
+            assignmentType: 'agent',
             assigneeId: '={{ $json.agent_id }}',
           },
           name: 'Assign Conversation',
-          type: '@renatoascencio/n8n-nodes-chatwoot.chatwoot',
+          type: CHATWOOT,
           typeVersion: 1,
           position: [910, 300],
-          credentials: { chatwootApi: { id: '', name: 'Chatwoot API' } },
+          credentials: CHATWOOT_API_CREDENTIAL,
         },
       ],
       connections: {
-        'Chatwoot Trigger': { main: [[{ node: 'Get Available Agents', type: 'main', index: 0 }]] },
-        'Get Available Agents': { main: [[{ node: 'Select Agent', type: 'main', index: 0 }]] },
-        'Select Agent': { main: [[{ node: 'Assign Conversation', type: 'main', index: 0 }]] },
+        'Chatwoot Trigger': { main: [[{ node: 'Get Agents', type: 'main', index: 0 }]] },
+        'Get Agents': { main: [[{ node: 'Select Online Agent', type: 'main', index: 0 }]] },
+        'Select Online Agent': { main: [[{ node: 'Assign Conversation', type: 'main', index: 0 }]] },
       },
     },
   },
@@ -224,7 +259,9 @@ return [{ json: { agent_id: selected.json.id } }];`,
   {
     id: 'chatwoot-public-contact',
     name: 'Chatwoot: Create Contact via Public API',
-    description: 'Creates a contact and conversation through the Public API, simulating a website widget interaction.',
+    description:
+      'Creates a contact and a conversation through the Public API of an API channel inbox, as a website widget would. ' +
+      'POST {"name": "...", "email": "..."}.',
     category: 'messaging',
     difficulty: 'beginner',
     requiredCredential: 'chatwootPublicApi',
@@ -242,31 +279,139 @@ return [{ json: { agent_id: selected.json.id } }];`,
           parameters: {
             resource: 'publicContact',
             operation: 'create',
-            name: '={{ $json.body.name }}',
-            email: '={{ $json.body.email }}',
+            // Public Contact > Create only reads Additional Fields
+            additionalFields: {
+              name: '={{ $json.body.name }}',
+              email: '={{ $json.body.email }}',
+            },
           },
           name: 'Create Public Contact',
-          type: '@renatoascencio/n8n-nodes-chatwoot.chatwoot',
+          type: CHATWOOT,
           typeVersion: 1,
           position: [470, 300],
-          credentials: { chatwootPublicApi: { id: '', name: 'Chatwoot Public API' } },
+          credentials: CHATWOOT_PUBLIC_API_CREDENTIAL,
         },
         {
           parameters: {
             resource: 'publicConversation',
             operation: 'create',
+            // The create response carries the contact identifier as source_id
             contactIdentifier: '={{ $json.source_id }}',
           },
           name: 'Create Conversation',
-          type: '@renatoascencio/n8n-nodes-chatwoot.chatwoot',
+          type: CHATWOOT,
           typeVersion: 1,
           position: [690, 300],
-          credentials: { chatwootPublicApi: { id: '', name: 'Chatwoot Public API' } },
+          credentials: CHATWOOT_PUBLIC_API_CREDENTIAL,
         },
       ],
       connections: {
         Webhook: { main: [[{ node: 'Create Public Contact', type: 'main', index: 0 }]] },
         'Create Public Contact': { main: [[{ node: 'Create Conversation', type: 'main', index: 0 }]] },
+      },
+    },
+  },
+
+  // =========================================================================
+  // Template 6: AI Agent with Chatwoot Tools (Advanced)
+  // =========================================================================
+  {
+    id: 'chatwoot-ai-agent',
+    name: 'Chatwoot: AI Agent Replies with Chatwoot Tools',
+    description:
+      'Answers incoming customer messages with an AI Agent that uses the Chatwoot node as a tool (usableAsTool): ' +
+      'it replies in the conversation and can hand it over to a human by setting it to open. ' +
+      'Only replies while the conversation is pending, so subsequent messages stay with the human after handoff. ' +
+      'Use an inbox whose conversations start as pending (agent bot inbox). Needs an OpenAI credential.',
+    category: 'ai',
+    difficulty: 'advanced',
+    requiredCredential: 'chatwootApi',
+    workflow: {
+      name: 'Chatwoot - AI Agent Replies',
+      nodes: [
+        {
+          parameters: {
+            source: 'accountWebhook',
+            events: ['message_created'],
+            // Only customer messages: the agent's own replies (outgoing) never re-trigger the workflow
+            filters: { messageTypes: ['incoming'], senderTypes: ['contact'], privateNotes: 'exclude' },
+          },
+          name: 'Chatwoot Trigger',
+          type: CHATWOOT_TRIGGER,
+          typeVersion: 1,
+          position: [250, 300],
+          credentials: CHATWOOT_API_CREDENTIAL,
+        },
+        {
+          parameters: {
+            jsCode: `// A handoff changes pending to open; do not reply again in the human's conversation.
+return $('Chatwoot Trigger').first().json.conversation?.status === 'pending' ? $input.all() : [];`,
+          },
+          name: 'Only Pending Conversations',
+          type: 'n8n-nodes-base.code',
+          typeVersion: 2,
+          position: [470, 300],
+        },
+        {
+          parameters: {
+            promptType: 'define',
+            text: "={{ $('Chatwoot Trigger').item.json.content }}",
+            options: {
+              systemMessage:
+                'You are a customer support assistant. Answer the customer with the "Reply to Customer" tool. ' +
+                'When you cannot help or the customer asks for a person, use the "Hand Off to Human" tool.',
+            },
+          },
+          name: 'AI Agent',
+          type: '@n8n/n8n-nodes-langchain.agent',
+          typeVersion: 3.1,
+          position: [690, 300],
+        },
+        {
+          parameters: { model: { __rl: true, mode: 'list', value: 'gpt-5-mini' }, options: {} },
+          name: 'OpenAI Chat Model',
+          type: '@n8n/n8n-nodes-langchain.lmChatOpenAi',
+          typeVersion: 1.3,
+          position: [570, 520],
+          credentials: { openAiApi: { id: '', name: 'OpenAI' } },
+        },
+        {
+          parameters: {
+            descriptionType: 'manual',
+            toolDescription: 'Send a reply to the customer in the current Chatwoot conversation',
+            resource: 'message',
+            operation: 'create',
+            conversationId: "={{ $('Chatwoot Trigger').item.json.conversation.id }}",
+            content: "={{ $fromAI('content', 'The reply to send to the customer', 'string') }}",
+          },
+          name: 'Reply to Customer',
+          type: CHATWOOT_TOOL,
+          typeVersion: 1,
+          position: [750, 520],
+          credentials: CHATWOOT_API_CREDENTIAL,
+        },
+        {
+          parameters: {
+            descriptionType: 'manual',
+            toolDescription: 'Hand the current Chatwoot conversation over to a human agent',
+            resource: 'conversation',
+            operation: 'updateStatus',
+            conversationId: "={{ $('Chatwoot Trigger').item.json.conversation.id }}",
+            status: 'open',
+          },
+          name: 'Hand Off to Human',
+          type: CHATWOOT_TOOL,
+          typeVersion: 1,
+          position: [930, 520],
+          credentials: CHATWOOT_API_CREDENTIAL,
+        },
+      ],
+      connections: {
+        'Chatwoot Trigger': { main: [[{ node: 'Only Pending Conversations', type: 'main', index: 0 }]] },
+        'Only Pending Conversations': { main: [[{ node: 'AI Agent', type: 'main', index: 0 }]] },
+        'OpenAI Chat Model': { ai_languageModel: [[{ node: 'AI Agent', type: 'ai_languageModel', index: 0 }]] },
+        'Reply to Customer': { ai_tool: [[{ node: 'AI Agent', type: 'ai_tool', index: 0 }]] },
+        'Hand Off to Human': { ai_tool: [[{ node: 'AI Agent', type: 'ai_tool', index: 0 }]] },
       },
     },
   },

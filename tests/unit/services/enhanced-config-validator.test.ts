@@ -34,6 +34,27 @@ describe('EnhancedConfigValidator', () => {
   });
 
   describe('validateWithMode', () => {
+    it('uses defaults from the selected resource when properties share a name', () => {
+      const properties = [
+        { name: 'resource', type: 'options', default: 'savedFilter', options: [{ value: 'savedFilter' }, { value: 'search' }] },
+        { name: 'query', type: 'json', default: '{}', displayOptions: { show: { resource: ['savedFilter'] } } },
+        { name: 'query', type: 'string', default: '', required: true, displayOptions: { show: { resource: ['search'] } } },
+      ];
+      const result = EnhancedConfigValidator.validateWithMode('nodes-base.test', { resource: 'search' }, properties);
+      expect(result.errors).toContainEqual(expect.objectContaining({ property: 'query', type: 'missing_required' }));
+      expect(EnhancedConfigValidator.validateWithMode('nodes-base.test', { resource: 'search', query: 'customer' }, properties).errors).toEqual([]);
+    });
+
+    it('resolves visible defaults even when their selectors appear later in the descriptor', () => {
+      const properties = [
+        { name: 'query', type: 'string', default: '', required: true, displayOptions: { show: { operation: ['search'] } } },
+        { name: 'operation', type: 'options', default: 'search', options: [{ value: 'search' }], displayOptions: { show: { resource: ['contact'] } } },
+        { name: 'resource', type: 'options', default: 'contact', options: [{ value: 'contact' }] },
+      ];
+      const result = EnhancedConfigValidator.validateWithMode('nodes-base.test', {}, properties);
+      expect(result.errors).toContainEqual(expect.objectContaining({ property: 'query', type: 'missing_required' }));
+    });
+
     it('should validate config with operation awareness', () => {
       const nodeType = 'nodes-base.slack';
       const config = {

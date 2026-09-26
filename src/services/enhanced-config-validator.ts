@@ -186,11 +186,19 @@ export class EnhancedConfigValidator extends ConfigValidator {
   private static applyNodeDefaults(properties: any[], config: Record<string, any>): Record<string, any> {
     const result = { ...config };
 
-    for (const prop of properties) {
-      if (prop.name && prop.default !== undefined && result[prop.name] === undefined) {
-        result[prop.name] = prop.default;
+    // Different resources often reuse a parameter name with different defaults. Hidden definitions
+    // must not supply the value for the selected operation. Repeat for defaults that reveal properties
+    // earlier in the descriptor (for example, an operation before its resource selector).
+    let changed: boolean;
+    do {
+      changed = false;
+      for (const prop of properties) {
+        if (prop.name && prop.default !== undefined && result[prop.name] === undefined && this.isPropertyVisible(prop, result)) {
+          result[prop.name] = prop.default;
+          changed = true;
+        }
       }
-    }
+    } while (changed);
 
     return result;
   }

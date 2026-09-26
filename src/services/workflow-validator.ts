@@ -959,7 +959,7 @@ export class WorkflowValidator {
         type: 'warning',
         nodeId: targetNode.id,
         nodeName: targetNode.name,
-        message: `Community node "${targetNode.name}" is being used as an AI tool. Ensure N8N_COMMUNITY_PACKAGES_ALLOW_TOOL_USAGE=true is set.`
+        message: `Community node "${targetNode.name}" is being used as an AI tool. Verify that its installed version declares usableAsTool and use its Tool variant.`
       });
     }
   }
@@ -1711,16 +1711,6 @@ export class WorkflowValidator {
         }
       }
       
-      // Check for community nodes used as tools
-      const hasAIToolConnections = Object.values(workflow.connections).some(
-        outputs => outputs.ai_tool && outputs.ai_tool.length > 0
-      );
-      
-      if (hasAIToolConnections) {
-        result.suggestions.push(
-          'For community nodes used as AI tools, ensure N8N_COMMUNITY_PACKAGES_ALLOW_TOOL_USAGE=true is set'
-        );
-      }
     }
   }
 

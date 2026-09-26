@@ -3,14 +3,14 @@
  *
  * Implements the chatwoot_doctor diagnostic tool that validates
  * the full Chatwoot integration stack: MCP server, n8n API,
- * Chatwoot node installation, credentials, and templates.
+ * Chatwoot node installation, credentials, catalog and templates.
  */
 
 import { McpToolResponse } from '../types/n8n-api';
 import { InstanceContext } from '../types/instance-context';
 import { ChatwootIntegration } from '../integrations/chatwoot';
 import { ChatwootConnectionValidator } from '../integrations/chatwoot';
-import { getN8nApiConfig } from '../config/n8n-api';
+import { getN8nApiConfig, getN8nApiConfigFromContext } from '../config/n8n-api';
 import { PROJECT_VERSION } from '../utils/version';
 import { logger } from '../utils/logger';
 
@@ -18,7 +18,22 @@ interface ChatwootDoctorArgs {
   chatwootBaseUrl?: string;
   chatwootAccountId?: string;
   chatwootToken?: string;
+  chatwootTokenType?: 'user' | 'agentBot';
+  chatwootPlatformToken?: string;
+  chatwootInboxIdentifier?: string;
   verbose?: boolean;
+}
+
+/** n8n 3.0 turns N8N_UNVERIFIED_PACKAGES_ENABLED off by default (docs: n8n 3.0 breaking changes) */
+export const N8N_3_UNVERIFIED_PACKAGES_NOTICE =
+  'n8n 3.0 changes the default of N8N_UNVERIFIED_PACKAGES_ENABLED to false: installing or updating this ' +
+  'unverified community package (UI, N8N_COMMUNITY_PACKAGES, reinstalling missing packages) is refused ' +
+  'unless N8N_UNVERIFIED_PACKAGES_ENABLED=true (env-managed installs may instead pin a trusted checksum). ' +
+  'Installed packages keep loading.';
+
+function majorVersion(version: unknown): number | undefined {
+  const match = typeof version === 'string' ? /^v?(\d+)\./.exec(version) : null;
+  return match ? Number(match[1]) : undefined;
 }
 
 export async function handleChatwootDoctor(
@@ -27,6 +42,12 @@ export async function handleChatwootDoctor(
 ): Promise<McpToolResponse> {
   const startTime = Date.now();
   const report: Record<string, unknown> = {};
+  const advisories: string[] = [];
+  const connectionIssues: string[] = [];
+  const apiConfig = (context && getN8nApiConfigFromContext(context)) || getN8nApiConfig();
+  const secrets = [args.chatwootToken, args.chatwootPlatformToken, apiConfig?.apiKey]
+    .filter((value): value is string => !!value);
+  const sanitize = (error: unknown) => sanitizeErrorMessage(error, secrets);
 
   // 1. MCP Server Info
   report.server = {
@@ -39,7 +60,6 @@ export async function handleChatwootDoctor(
   };
 
   // 2. n8n API Connectivity
-  const apiConfig = getN8nApiConfig();
   const n8nApiStatus: Record<string, unknown> = {
     configured: apiConfig !== null,
     baseUrl: apiConfig?.baseUrl ?? null,
@@ -59,7 +79,7 @@ export async function handleChatwootDoctor(
       }
     } catch (error) {
       n8nApiStatus.connected = false;
-      n8nApiStatus.error = sanitizeErrorMessage(error);
+      n8nApiStatus.error = sanitize(error);
     }
   }
   report.n8nApi = n8nApiStatus;
@@ -67,6 +87,11 @@ export async function handleChatwootDoctor(
   // 3. Chatwoot Node Installation (credentials check via n8n API)
   const nodeInstallation: Record<string, unknown> = {
     packageName: ChatwootIntegration.getPackageName(),
+    catalogVersion: ChatwootIntegration.getPackageVersion(),
+    verifiedByN8n: false,
+    n8n3Notice: N8N_3_UNVERIFIED_PACKAGES_NOTICE,
+    installationVerified: false,
+    note: 'Credential presence does not verify package installation or its installed version.',
     checked: false,
   };
 
@@ -91,17 +116,23 @@ export async function handleChatwootDoctor(
       }
     } catch (error) {
       nodeInstallation.checked = true;
-      nodeInstallation.error = sanitizeErrorMessage(error);
+      nodeInstallation.error = sanitize(error);
     }
   }
   report.chatwootNode = nodeInstallation;
 
-  // 4. Template Availability
+  const n8nMajor = majorVersion(n8nApiStatus.n8nVersion);
+  if (n8nMajor !== undefined && n8nMajor >= 3) {
+    advisories.push(N8N_3_UNVERIFIED_PACKAGES_NOTICE);
+  }
+
+  // 4. Templates: every Chatwoot parameter and trigger payload path is checked against the node catalog
   const templates = ChatwootIntegration.listTemplates();
+  const invalidTemplates = ChatwootIntegration.validateTemplates();
   report.templates = {
     available: templates.length,
-    expected: 5,
-    healthy: templates.length === 5,
+    invalid: invalidTemplates,
+    healthy: templates.length > 0 && invalidTemplates.length === 0,
     list: templates.map((t) => ({ id: t.id, name: t.name, category: t.category })),
   };
 
@@ -113,51 +144,78 @@ export async function handleChatwootDoctor(
       accountIdProvided: !!args.chatwootAccountId,
     };
 
-    if (args.chatwootToken && args.chatwootAccountId) {
+    const summarize = (result: Awaited<ReturnType<typeof ChatwootConnectionValidator.testPlatformApi>>) => ({
+      success: result.success,
+      message: sanitize(result.message),
+      ...(result.details ? { status: result.details.status } : {}),
+    });
+    const safely = async (api: string, test: () => ReturnType<typeof ChatwootConnectionValidator.testPlatformApi>) => {
       try {
-        const result = await ChatwootConnectionValidator.testApplicationApi(
-          args.chatwootBaseUrl,
-          args.chatwootAccountId,
-          args.chatwootToken,
-        );
-        chatwootApi.applicationApi = {
-          success: result.success,
-          message: result.message,
-          ...(result.details ? { status: result.details.status } : {}),
-        };
+        const result = summarize(await test());
+        if (!result.success) connectionIssues.push(`Chatwoot ${api} check failed`);
+        return result;
       } catch (error) {
-        chatwootApi.applicationApi = {
-          success: false,
-          message: sanitizeErrorMessage(error),
-        };
+        connectionIssues.push(`Chatwoot ${api} check failed`);
+        return { success: false, message: sanitize(error) };
       }
+    };
+
+    if (args.chatwootToken && args.chatwootAccountId) {
+      chatwootApi.applicationApi = await safely('Application API', () =>
+        ChatwootConnectionValidator.testApplicationApi(
+          args.chatwootBaseUrl!,
+          args.chatwootAccountId!,
+          args.chatwootToken!,
+          args.chatwootTokenType ?? 'user',
+        ),
+      );
     } else if (args.chatwootToken) {
       chatwootApi.note =
         'Provide both chatwootAccountId and chatwootToken to test Application API';
+      connectionIssues.push('Chatwoot Application API check requires chatwootAccountId');
+    }
+
+    if (args.chatwootPlatformToken) {
+      chatwootApi.platformApi = await safely('Platform API', () =>
+        ChatwootConnectionValidator.testPlatformApi(args.chatwootBaseUrl!, args.chatwootPlatformToken!),
+      );
+    }
+
+    if (args.chatwootInboxIdentifier) {
+      chatwootApi.publicApi = await safely('Public API', () =>
+        ChatwootConnectionValidator.testPublicApi(args.chatwootBaseUrl!, args.chatwootInboxIdentifier!),
+      );
     }
 
     report.chatwootApi = chatwootApi;
+  } else if (args.chatwootToken || args.chatwootPlatformToken || args.chatwootInboxIdentifier) {
+    connectionIssues.push('Chatwoot API checks require chatwootBaseUrl');
   }
 
   // 6. Summary
-  const issues: string[] = [];
+  const issues: string[] = [...connectionIssues];
   if (!apiConfig) issues.push('n8n API not configured (N8N_API_URL/N8N_API_KEY missing)');
   if (apiConfig && !n8nApiStatus.connected)
     issues.push('n8n API configured but not reachable');
+  if (nodeInstallation.error) issues.push('Could not check Chatwoot credentials in n8n instance');
   if (
     nodeInstallation.checked &&
     (nodeInstallation.credentialsFound as number) === 0
   ) {
     issues.push('No Chatwoot credentials found in n8n instance');
   }
-  if (templates.length !== 5) {
-    issues.push(`Expected 5 templates, found ${templates.length}`);
+  if (templates.length === 0) {
+    issues.push('No Chatwoot workflow templates available');
+  }
+  for (const template of invalidTemplates) {
+    issues.push(`Template ${template.id} does not match the Chatwoot node catalog (${template.issues.length} issues)`);
   }
 
   report.summary = {
     healthy: issues.length === 0,
     issueCount: issues.length,
     issues,
+    advisories,
     responseTimeMs: Date.now() - startTime,
   };
 
@@ -172,6 +230,7 @@ export async function handleChatwootDoctor(
           k === 'IS_DOCKER',
       ),
       chatwootCapabilities: ChatwootIntegration.getCapabilitiesSummary(),
+      installationGuide: ChatwootIntegration.getInstallationGuide(),
     };
   }
 
@@ -185,8 +244,11 @@ export async function handleChatwootDoctor(
 }
 
 /** Sanitize error messages to prevent secret leakage */
-function sanitizeErrorMessage(error: unknown): string {
-  const msg = error instanceof Error ? error.message : String(error);
+function sanitizeErrorMessage(error: unknown, secrets: string[] = []): string {
+  let msg = error instanceof Error ? error.message : String(error);
+  for (const secret of [...secrets].sort((a, b) => b.length - a.length)) {
+    msg = msg.split(secret).join('***');
+  }
   return msg
     .replace(/api_access_token[=:]\s*\S+/gi, 'api_access_token=***')
     .replace(/token[=:]\s*[A-Za-z0-9_\-]{20,}/gi, 'token=***')
