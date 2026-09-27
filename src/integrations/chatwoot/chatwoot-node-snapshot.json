@@ -1,7 +1,7 @@
 {
   "packageName": "@renatoascencio/n8n-nodes-chatwoot",
   "packageVersion": "0.9.0",
-  "source": "n8n-nodes-chatwoot feat/v0.9.0@9166f80+worktree.sha256:61b7790e810a5eb39bb1bc0fe64fe1fe265369a95500ba6837c648324b74f492",
+  "source": "@renatoascencio/n8n-nodes-chatwoot@0.9.0 (npm)",
   "nodes": [
     {
       "style": "programmatic",
@@ -912,7 +912,7 @@
             {
               "name": "Update Status",
               "value": "updateStatus",
-              "description": "Update status. Open assigns to an agent-role token owner; on Chatwoot 4.18+ any user token also removes the bot or Captain assignee.",
+              "description": "Update status. Open assigns to an agent-role token owner; on Chatwoot 4.17.1 and later any user token also removes the bot or Captain assignee.",
               "action": "Update conversation status"
             }
           ],
@@ -6908,7 +6908,7 @@
             {
               "name": "Open",
               "value": "open",
-              "description": "Open the conversation. An agent-role token assigns it to the token owner; on Chatwoot 4.18+ any user token also removes the agent bot or Captain assignee."
+              "description": "Open the conversation. An agent-role token assigns it to the token owner; on Chatwoot 4.17.1 and later any user token also removes the agent bot or Captain assignee."
             },
             {
               "name": "Pending",
@@ -8074,7 +8074,7 @@
           "name": "content",
           "type": "string",
           "default": "",
-          "description": "The message text. Optional when the message has attachments (it becomes the caption), a template or a non-text content type.",
+          "description": "The message text, or caption for attachments. May be empty, including for a template or non-text content type.",
           "displayOptions": {
             "show": {
               "resource": [
@@ -17879,7 +17879,7 @@
         {
           "operation": "updateStatus",
           "name": "Update Status",
-          "description": "Update status. Open assigns to an agent-role token owner; on Chatwoot 4.18+ any user token also removes the bot or Captain assignee.",
+          "description": "Update status. Open assigns to an agent-role token owner; on Chatwoot 4.17.1 and later any user token also removes the bot or Captain assignee.",
           "resource": "conversation"
         },
         {
