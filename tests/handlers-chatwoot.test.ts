@@ -64,6 +64,8 @@ const API_CONFIG = {
   apiKey: 'test-key',
   timeout: 30000,
   maxRetries: 3,
+  cfClientId: undefined,
+  cfClientSecret: undefined,
 };
 
 function connectedClient(n8nVersion: string, credentials = [{ name: 'My Chatwoot', type: 'chatwootApi' }]) {

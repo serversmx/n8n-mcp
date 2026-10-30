@@ -289,9 +289,26 @@ export class ConfigValidator {
     errors: ValidationError[]
   ): void {
     for (const [key, value] of Object.entries(config)) {
-      const prop = properties.find(p => p.name === key);
-      if (!prop) continue;
-      
+      const candidates = properties.filter(p => p && p.name === key);
+      if (candidates.length === 0) continue;
+
+      // A null/undefined value is the required check's business. Reporting it
+      // here as well ("must be a string, got object") describes the same defect
+      // a second time.
+      if (value === null || value === undefined) continue;
+
+      // Several definitions can share a name (one per resource/operation);
+      // validate against the one visible for the current config rather than
+      // whichever happens to come first in the schema array.
+      const prop = candidates.find(p => this.isPropertyVisible(p, config)) ?? candidates[0];
+
+      // A value equal to a same-named definition's schema default was injected
+      // by default resolution rather than set by the user; type-checking it
+      // against a different variant's type produces false errors.
+      if (candidates.some(p => 'default' in p && JSON.stringify(value) === JSON.stringify(p.default))) {
+        continue;
+      }
+
       // Type validation
       if (prop.type === 'string' && typeof value !== 'string') {
         errors.push({
@@ -314,8 +331,10 @@ export class ConfigValidator {
           message: `Property '${key}' must be a boolean, got ${typeof value}`,
           fix: `Change ${key} to true or false`
         });
-      } else if (prop.type === 'resourceLocator') {
+      } else if (prop.type === 'resourceLocator' || prop.type === 'agentSelector') {
         // resourceLocator validation: Used by AI model nodes (OpenAI, Anthropic, etc.)
+        // agentSelector (n8n 2.31) carries the same shape and n8n validates it
+        // through the same path in node-helpers.
         // Must be an object with required properties:
         //   - mode: string ('list' | 'id' | 'url')
         //   - value: any (the actual model/resource identifier)
@@ -325,26 +344,28 @@ export class ConfigValidator {
           errors.push({
             type: 'invalid_type',
             property: key,
-            message: `Property '${key}' is a resourceLocator and must be an object with 'mode' and 'value' properties, got ${typeof value}`,
+            message: `Property '${key}' has type ${prop.type} and must be an object with 'mode' and 'value' properties, got ${typeof value}`,
             fix: `Change ${key} to { mode: "list", value: ${JSON.stringify(fixValue)} } or { mode: "id", value: ${JSON.stringify(fixValue)} }`
           });
         } else {
-          // Check required properties
-          if (!value.mode) {
+          // Check required properties. An empty-string mode is a UI-persisted
+          // artifact that n8n tolerates (the value/expression still resolves),
+          // so only undefined/null count as a missing mode.
+          if (value.mode === undefined || value.mode === null) {
             errors.push({
               type: 'missing_required',
               property: `${key}.mode`,
-              message: `resourceLocator '${key}' is missing required property 'mode'`,
+              message: `${prop.type} '${key}' is missing required property 'mode'`,
               fix: `Add mode property: { mode: "list", value: ${JSON.stringify(value.value || '')} }`
             });
           } else if (typeof value.mode !== 'string') {
             errors.push({
               type: 'invalid_type',
               property: `${key}.mode`,
-              message: `resourceLocator '${key}.mode' must be a string, got ${typeof value.mode}`,
+              message: `${prop.type} '${key}.mode' must be a string, got ${typeof value.mode}`,
               fix: `Set mode to a valid string value`
             });
-          } else if (prop.modes) {
+          } else if (value.mode !== '' && prop.modes) {
             // Schema-based validation: Check if mode exists in the modes definition
             // In n8n, modes are defined at the top level of resourceLocator properties
             // Modes can be defined in different ways:
@@ -375,7 +396,7 @@ export class ConfigValidator {
               errors.push({
                 type: 'invalid_value',
                 property: `${key}.mode`,
-                message: `resourceLocator '${key}.mode' must be one of [${allowedModes.join(', ')}], got '${value.mode}'`,
+                message: `${prop.type} '${key}.mode' must be one of [${allowedModes.join(', ')}], got '${value.mode}'`,
                 fix: `Change mode to one of: ${allowedModes.join(', ')}`
               });
             }
@@ -387,7 +408,7 @@ export class ConfigValidator {
             errors.push({
               type: 'missing_required',
               property: `${key}.value`,
-              message: `resourceLocator '${key}' is missing required property 'value'`,
+              message: `${prop.type} '${key}' is missing required property 'value'`,
               fix: `Add value property to specify the ${prop.displayName || key}`
             });
           }
@@ -396,11 +417,26 @@ export class ConfigValidator {
 
       // Options validation
       if (prop.type === 'options' && prop.options) {
-        const validValues = prop.options.map((opt: any) => 
+        const validValues = prop.options.map((opt: any) =>
           typeof opt === 'string' ? opt : opt.value
         );
-        
-        if (!validValues.includes(value)) {
+
+        // Expression values resolve at runtime and cannot be enum-checked
+        const isExpression = typeof value === 'string' && value.startsWith('=');
+        // Dynamic option lists are fetched at runtime; the static list is
+        // empty or incomplete, so enum-checking rejects valid values
+        const hasDynamicOptions = !!(prop.typeOptions?.loadOptionsMethod || prop.typeOptions?.loadOptions);
+        // Legacy Code-node language value that n8n still executes
+        // (renamed to pythonNative but kept for backwards compatibility)
+        const isLegacyCodeLanguage = key === 'language' && value === 'python' && validValues.includes('pythonNative');
+
+        if (
+          validValues.length > 0 &&
+          !isExpression &&
+          !hasDynamicOptions &&
+          !isLegacyCodeLanguage &&
+          !validValues.includes(value)
+        ) {
           errors.push({
             type: 'invalid_value',
             property: key,
@@ -595,9 +631,13 @@ export class ConfigValidator {
     errors: ValidationError[],
     warnings: ValidationWarning[]
   ): void {
-    const codeField = config.language === 'python' ? 'pythonCode' : 'jsCode';
+    // n8n 2.x names the Python option 'pythonNative'; the legacy 'python' value
+    // still executes. Both store their code in pythonCode.
+    const rawLanguage = config.language || 'javascript';
+    const language = rawLanguage === 'pythonNative' ? 'python' : rawLanguage;
+    const codeField = language === 'python' ? 'pythonCode' : 'jsCode';
     const code = config[codeField];
-    
+
     if (!code || code.trim() === '') {
       errors.push({
         type: 'missing_required',
@@ -607,25 +647,27 @@ export class ConfigValidator {
       });
       return;
     }
-    
-    // Security checks
-    if (code?.includes('eval(') || code?.includes('exec(')) {
+
+    // Security checks. Python eval/exec are denied builtins in the native
+    // runtime and are reported as errors by NodeSpecificValidators, so this
+    // softer warning stays JavaScript-only to avoid a duplicate message.
+    if (language !== 'python' && (code?.includes('eval(') || code?.includes('exec('))) {
       warnings.push({
         type: 'security',
         message: 'Code contains eval/exec which can be a security risk',
         suggestion: 'Avoid using eval/exec with untrusted input'
       });
     }
-    
+
     // Basic syntax validation
-    if (config.language === 'python') {
+    if (language === 'python') {
       this.validatePythonSyntax(code, errors, warnings);
     } else {
       this.validateJavaScriptSyntax(code, errors, warnings);
     }
-    
+
     // n8n-specific patterns
-    this.validateN8nCodePatterns(code, config.language || 'javascript', errors, warnings);
+    this.validateN8nCodePatterns(code, language, errors, warnings);
   }
   
   /**
@@ -670,6 +712,18 @@ export class ConfigValidator {
 
       // Check if property is visible with current settings
       if (!visibleProps.find(p => p.name === key)) {
+        const value = config[key];
+
+        // A property with no value (or still at its schema default) has no
+        // runtime effect regardless of visibility — warning about such
+        // UI-persisted leftovers is pure noise.
+        if (value === null || value === undefined || value === '') {
+          continue;
+        }
+        if (prop && 'default' in prop && JSON.stringify(value) === JSON.stringify(prop.default)) {
+          continue;
+        }
+
         // Get visibility requirements for better error message
         const visibilityReq = this.getVisibilityRequirement(prop, config);
 
@@ -788,8 +842,8 @@ export class ConfigValidator {
     }
     
     // Check for unterminated strings
-    const stringMatches = code.match(/(["'`])(?:(?=(\\?))\2.)*?\1/g) || [];
-    const quotesInStrings = stringMatches.join('').match(/["'`]/g)?.length || 0;
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): linear scan instead of a backtracking regex
+    const quotesInStrings = this.countQuotesInStringLiterals(code);
     const totalQuotes = (code.match(/["'`]/g) || []).length;
     if ((totalQuotes - quotesInStrings) % 2 !== 0) {
       warnings.push({
@@ -854,8 +908,8 @@ export class ConfigValidator {
     }
     
     // Check for colons after control structures
-    const controlStructures = /^\s*(if|elif|else|for|while|def|class|try|except|finally|with)\s+.*[^:]\s*$/gm;
-    if (controlStructures.test(code)) {
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): linear scan instead of a backtracking regex
+    if (this.hasControlStructureWithoutColon(code)) {
       warnings.push({
         type: 'inefficient',
         message: 'Missing colon after control structure',
@@ -898,7 +952,8 @@ export class ConfigValidator {
       }
       
       // Check for return without array
-      if (/return\s+{[^}]+}\s*;/.test(code) && !code.includes('[') && !code.includes(']')) {
+      // SECURITY (GHSA-xvxq-x6hr-xc2c): linear scan instead of a backtracking regex
+      if (this.hasReturnOfPlainObject(code) && !code.includes('[') && !code.includes(']')) {
         warnings.push({
           type: 'invalid_value',
           message: 'Return value must be an array',
@@ -916,57 +971,11 @@ export class ConfigValidator {
       }
     }
     
-    // Check return format for Python
-    if (language === 'python' && hasReturn) {
-      // DEBUG: Log to see if we're entering this block
-      if (code.includes('result = {"data": "value"}')) {
-        console.log('DEBUG: Processing Python code with result variable');
-        console.log('DEBUG: Language:', language);
-        console.log('DEBUG: Has return:', hasReturn);
-      }
-      // Check for common incorrect patterns
-      if (/return\s+items\s*$/.test(code) && !code.includes('json') && !code.includes('dict')) {
-        warnings.push({
-          type: 'best_practice',
-          message: 'Returning items directly - ensure each item is a dict with "json" key',
-          suggestion: 'Use: return [{"json": item.json} for item in items]'
-        });
-      }
-      
-      // Check for dict return without list
-      if (/return\s+{['"]/.test(code) && !code.includes('[') && !code.includes(']')) {
-        warnings.push({
-          type: 'invalid_value',
-          message: 'Return value must be a list',
-          suggestion: 'Wrap your return dict in a list: return [{"json": {"your": "data"}}]'
-        });
-      }
-      
-      // Check for returning objects without json key
-      if (/return\s+(?!.*\[).*{(?!.*["']json["'])/.test(code)) {
-        warnings.push({
-          type: 'invalid_value',
-          message: 'Must return array of objects with json key',
-          suggestion: 'Use format: return [{"json": {"data": "value"}}]'
-        });
-      }
-      
-      // Check for returning variable that might contain invalid format
-      const returnMatch = code.match(/return\s+(\w+)\s*(?:#|$)/m);
-      if (returnMatch) {
-        const varName = returnMatch[1];
-        // Check if this variable is assigned a dict without being in a list
-        const assignmentRegex = new RegExp(`${varName}\\s*=\\s*{[^}]+}`, 'm');
-        if (assignmentRegex.test(code) && !new RegExp(`${varName}\\s*=\\s*\\[`).test(code)) {
-          warnings.push({
-            type: 'invalid_value',
-            message: 'Must return array of objects with json key',
-            suggestion: `Wrap ${varName} in a list with json key: return [{"json": ${varName}}]`
-          });
-        }
-      }
-    }
-    
+    // Python return shapes are validated by NodeSpecificValidators, which knows
+    // the node's mode. Native Python auto-wraps a single dict and a list of plain
+    // dicts, so the old "must be a list of dicts with a json key" warnings here
+    // reported valid code.
+
     // Check for common n8n variables and patterns
     if (language === 'javascript') {
       // Check if accessing items/input
@@ -1046,30 +1055,16 @@ export class ConfigValidator {
         });
       }
     } else if (language === 'python') {
-      // Python-specific checks
-      if (!code.includes('items') && !code.includes('_input')) {
-        warnings.push({
-          type: 'missing_common',
-          message: 'Code doesn\'t reference input items',
-          suggestion: 'Access input data with: items variable'
-        });
-      }
-      
+      // Input references and imports are checked by NodeSpecificValidators,
+      // which knows the node's mode and reports every blocked import, not just
+      // a hardcoded few.
+
       // Check for print statements
       if (code.includes('print(')) {
         warnings.push({
           type: 'best_practice',
           message: 'print() output appears in n8n execution logs',
           suggestion: 'Remove print statements in production or use them sparingly'
-        });
-      }
-      
-      // Check for common Python mistakes
-      if (code.includes('import requests') || code.includes('import pandas')) {
-        warnings.push({
-          type: 'invalid_value',
-          message: 'External libraries not available in Code node',
-          suggestion: 'Only Python standard library is available. For HTTP requests, use JavaScript with $helpers.httpRequest'
         });
       }
     }
@@ -1092,6 +1087,146 @@ export class ConfigValidator {
           suggestion: 'Consider adding try/catch (JavaScript) or try/except (Python) for robust error handling'
         });
       }
+    }
+  }
+
+  private static isLineTerminator(ch: string): boolean {
+    return ch === '\n' || ch === '\r' || ch === '\u2028' || ch === '\u2029';
+  }
+
+  private static readonly WHITESPACE = /\s/;
+
+  private static isWhitespace(ch: string): boolean {
+    return this.WHITESPACE.test(ch);
+  }
+
+  /**
+   * Count the quote characters that sit inside single-line string literals.
+   * A literal opens at any quote, skips backslash escapes and closes at the
+   * next unescaped quote of the same kind on the same line. A quote with no
+   * closing partner is skipped and scanning resumes at the next character.
+   */
+  private static countQuotesInStringLiterals(code: string): number {
+    const isQuote = (ch: string) => ch === '"' || ch === "'" || ch === '`';
+    let count = 0;
+    for (const line of code.split(/[\n\r\u2028\u2029]/)) {
+      // Positions of unescaped quotes, per quote kind, in ascending order
+      const closers: Record<string, number[]> = { '"': [], "'": [], '`': [] };
+      let backslashes = 0;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '\\') {
+          backslashes++;
+          continue;
+        }
+        if (isQuote(ch) && backslashes % 2 === 0) closers[ch].push(i);
+        backslashes = 0;
+      }
+
+      const next: Record<string, number> = { '"': 0, "'": 0, '`': 0 };
+      let k = 0;
+      while (k < line.length) {
+        const quote = line[k];
+        if (!isQuote(quote)) {
+          k++;
+          continue;
+        }
+        const list = closers[quote];
+        while (next[quote] < list.length && list[next[quote]] <= k) next[quote]++;
+        if (next[quote] === list.length) {
+          k++;
+          continue;
+        }
+        const end = list[next[quote]];
+        for (let i = k; i <= end; i++) {
+          if (isQuote(line[i])) count++;
+        }
+        k = end + 1;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Detect a Python control-structure line that the colon check flags: a line
+   * starting with a control keyword and whitespace whose statement does not end
+   * in ':' (trailing whitespace and blank continuation lines count as not ending
+   * in ':').
+   */
+  private static hasControlStructureWithoutColon(code: string): boolean {
+    const keywords = ['if', 'elif', 'else', 'for', 'while', 'def', 'class', 'try', 'except', 'finally', 'with'];
+    const n = code.length;
+    let lineStart = 0;
+    while (lineStart <= n) {
+      // First non-whitespace character of this line
+      let firstCode = lineStart;
+      while (firstCode < n && !this.isLineTerminator(code[firstCode]) && this.isWhitespace(code[firstCode])) firstCode++;
+      let lineEnd = firstCode;
+      while (lineEnd < n && !this.isLineTerminator(code[lineEnd])) lineEnd++;
+
+      if (firstCode < lineEnd) {
+        const keyword = keywords.find(kw => code.startsWith(kw, firstCode));
+        const keywordEnd = keyword ? firstCode + keyword.length : -1;
+        if (keyword && keywordEnd < n && this.isWhitespace(code[keywordEnd])) {
+          // nextCode: first non-whitespace at or after keywordEnd; any line terminator
+          // between keywordEnd + 2 and nextCode ends the statement on a whitespace character.
+          let nextCode = keywordEnd;
+          let terminatorAfterStart = false;
+          while (nextCode < n && this.isWhitespace(code[nextCode])) {
+            if (nextCode >= keywordEnd + 2 && this.isLineTerminator(code[nextCode])) terminatorAfterStart = true;
+            nextCode++;
+          }
+          if (nextCode === n) {
+            if (keywordEnd + 1 < n) return true;
+          } else {
+            if (terminatorAfterStart) return true;
+            // statementEnd: end of the line holding nextCode; lastCode: its last
+            // non-whitespace character
+            let statementEnd = nextCode;
+            let lastCode = nextCode;
+            while (statementEnd < n && !this.isLineTerminator(code[statementEnd])) {
+              if (!this.isWhitespace(code[statementEnd])) lastCode = statementEnd;
+              statementEnd++;
+            }
+            if (code[lastCode] !== ':' || lastCode < statementEnd - 1) return true;
+            // The terminator itself ends the statement when only whitespace
+            // follows it up to another terminator or the end of the code.
+            if (statementEnd < n) {
+              let after = statementEnd + 1;
+              while (after < n && this.isWhitespace(code[after]) && !this.isLineTerminator(code[after])) after++;
+              if (after === n || this.isLineTerminator(code[after])) return true;
+            }
+          }
+        }
+      }
+      lineStart = lineEnd + 1;
+    }
+    return false;
+  }
+
+  /**
+   * Detect `return` + whitespace + `{`, at least one character other than `}`,
+   * then `}`, optional whitespace and `;`.
+   */
+  private static hasReturnOfPlainObject(code: string): boolean {
+    // First '}' after the current '{'
+    let close = -2;
+    let checkedClose = -1;
+    let from = 0;
+    while (true) {
+      const start = code.indexOf('return', from);
+      if (start === -1) return false;
+      from = start + 1;
+      let brace = start + 6;
+      while (brace < code.length && this.isWhitespace(code[brace])) brace++;
+      if (brace === start + 6 || code[brace] !== '{') continue;
+      if (close === -2 || (close !== -1 && close <= brace)) close = code.indexOf('}', brace + 1);
+      if (close === -1) return false;
+      if (close < brace + 2 || close === checkedClose) continue;
+      checkedClose = close;
+      let afterClose = close + 1;
+      while (afterClose < code.length && this.isWhitespace(code[afterClose])) afterClose++;
+      if (code[afterClose] === ';') return true;
     }
   }
 }

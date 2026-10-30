@@ -24,7 +24,15 @@ import {
   Workflow,
 } from '../types/n8n-api';
 import { logger } from '../utils/logger';
-import { processErrorExecution } from './error-execution-processor';
+import { hasRecordedError, processErrorExecution } from './error-execution-processor';
+import {
+  extractConnectionBranches,
+  firstRunItem,
+  getRunError,
+  mergeRunBranches,
+  totalExecutionTime,
+  type RunBranch,
+} from './execution-run-data';
 
 /**
  * Size estimation and threshold constants
@@ -116,15 +124,11 @@ function countItems(nodeData: unknown): { input: number; output: number } {
   }
 
   for (const run of nodeData) {
-    if (run?.data?.main) {
-      const mainData = run.data.main;
-      if (Array.isArray(mainData)) {
-        for (const output of mainData) {
-          if (Array.isArray(output)) {
-            counts.output += output.length;
-          }
-        }
-      }
+    for (const output of extractConnectionBranches(run?.data)) {
+      counts.output += output?.length ?? 0;
+    }
+    for (const input of extractConnectionBranches(run?.inputOverride)) {
+      counts.input += input?.length ?? 0;
     }
   }
 
@@ -167,14 +171,11 @@ export function generatePreview(execution: Execution): {
     const nodeData = runData[nodeName];
     const itemCounts = countItems(nodeData);
 
-    // Extract structure from first run's first output item
+    // Structure of the first output item any run produced
     let dataStructure: Record<string, unknown> = {};
-    if (Array.isArray(nodeData) && nodeData.length > 0) {
-      const firstRun = nodeData[0];
-      const firstItem = firstRun?.data?.main?.[0]?.[0];
-      if (firstItem) {
-        dataStructure = extractStructure(firstItem) as Record<string, unknown>;
-      }
+    const firstItem = firstRunItem(nodeData);
+    if (firstItem) {
+      dataStructure = extractStructure(firstItem) as Record<string, unknown>;
     }
 
     const nodeSize = estimateDataSize(nodeData);
@@ -186,15 +187,10 @@ export function generatePreview(execution: Execution): {
       estimatedSizeKB: nodeSize,
     };
 
-    // Check for errors
-    if (Array.isArray(nodeData)) {
-      for (const run of nodeData) {
-        if (run.error) {
-          nodePreview.status = 'error';
-          nodePreview.error = extractErrorMessage(run.error);
-          break;
-        }
-      }
+    const runError = getRunError(nodeData);
+    if (runError) {
+      nodePreview.status = 'error';
+      nodePreview.error = extractErrorMessage(runError);
     }
 
     preview.nodes[nodeName] = nodePreview;
@@ -256,33 +252,38 @@ function generateRecommendation(
  * Truncate items array with metadata
  */
 function truncateItems(
-  items: unknown[][],
-  limit: number
+  items: RunBranch[],
+  limit: number,
+  knownTotal?: number
 ): {
-  truncated: unknown[][];
+  truncated: RunBranch[];
   metadata: { totalItems: number; itemsShown: number; truncated: boolean };
 } {
   if (!Array.isArray(items) || items.length === 0) {
     return {
       truncated: items || [],
       metadata: {
-        totalItems: 0,
+        totalItems: knownTotal ?? 0,
         itemsShown: 0,
-        truncated: false,
+        truncated: (knownTotal ?? 0) > 0,
       },
     };
   }
 
-  let totalItems = 0;
-  for (const output of items) {
-    if (Array.isArray(output)) {
-      totalItems += output.length;
+  // `knownTotal` lets the caller pass branches merged only up to the limit.
+  let totalItems = knownTotal ?? 0;
+  if (knownTotal === undefined) {
+    for (const output of items) {
+      if (Array.isArray(output)) {
+        totalItems += output.length;
+      }
     }
   }
 
   // Special case: limit = 0 means structure only
   if (limit === 0) {
     const structureOnly = items.map(output => {
+      if (output === null) return null;
       if (!Array.isArray(output) || output.length === 0) {
         return [];
       }
@@ -294,7 +295,7 @@ function truncateItems(
       metadata: {
         totalItems,
         itemsShown: 0,
-        truncated: true,
+        truncated: totalItems > 0,
       },
     };
   }
@@ -312,7 +313,7 @@ function truncateItems(
   }
 
   // Apply limit
-  const result: unknown[][] = [];
+  const result: RunBranch[] = [];
   let itemsShown = 0;
 
   for (const output of items) {
@@ -339,6 +340,19 @@ function truncateItems(
       truncated: itemsShown < totalItems,
     },
   };
+}
+
+/**
+ * Explains an error-mode request on an execution without a recorded error.
+ */
+function noRecordedErrorNote(status: string): string {
+  if (status === 'success') {
+    return 'The execution succeeded, so there is no error to analyse. Nodes that handle errors themselves may still output items with an "error" field; use mode="summary" to inspect its data.';
+  }
+  if (status === 'waiting' || status === 'running' || status === 'new') {
+    return `The execution has not finished (status "${status}"), so there is no error to analyse yet. Use mode="summary" to inspect what ran.`;
+  }
+  return `n8n recorded no error details for this execution (status "${status}"): no top-level error and no node error, or the execution data was not saved. Use mode="summary" to inspect what ran.`;
 }
 
 /**
@@ -393,17 +407,25 @@ export function filterExecutionData(
 
   // Handle error mode
   if (mode === 'error') {
-    const errorAnalysis = processErrorExecution(execution, {
-      itemsLimit: options.errorItemsLimit ?? 2,
-      includeStackTrace: options.includeStackTrace ?? false,
-      includeExecutionPath: options.includeExecutionPath !== false,
-      workflow
-    });
-
     const runData = execution.data?.resultData?.runData || {};
     const executedNodes = Object.keys(runData).length;
 
-    response.errorInfo = errorAnalysis;
+    if (hasRecordedError(execution)) {
+      response.errorInfo = processErrorExecution(execution, {
+        itemsLimit: options.errorItemsLimit ?? 2,
+        includeStackTrace: options.includeStackTrace ?? false,
+        includeExecutionPath: options.includeExecutionPath !== false,
+        workflow
+      });
+      if (execution.status === 'success') {
+        response.errorInfoNote = 'The execution succeeded, so this node error did not stop the workflow.';
+      }
+    } else {
+      // Without a recorded error the analysis would name the last node with
+      // "Unknown error", so report that there is nothing to diagnose instead.
+      response.errorInfoNote = noRecordedErrorNote(execution.status);
+    }
+
     response.summary = {
       totalNodes: executedNodes,
       executedNodes,
@@ -460,42 +482,40 @@ export function filterExecutionData(
       continue;
     }
 
-    // Get first run data
-    const firstRun = nodeData[0];
+    // Every field aggregates across all runs of the node.
     const itemCounts = countItems(nodeData);
     totalItems += itemCounts.output;
 
     const nodeResult: FilteredNodeData = {
-      executionTime: firstRun.executionTime,
+      executionTime: totalExecutionTime(nodeData),
       itemsInput: itemCounts.input,
       itemsOutput: itemCounts.output,
       status: 'success',
     };
 
-    // Check for errors
-    if (firstRun.error) {
+    const runError = getRunError(nodeData);
+    if (runError) {
       nodeResult.status = 'error';
-      nodeResult.error = extractErrorMessage(firstRun.error);
+      nodeResult.error = extractErrorMessage(runError);
     }
 
-    // Handle full mode - include all data
+    // Merge only as many items per branch as will be shown; the counts above supply the totals.
+    // Structure-only (limit 0) still needs the first item of each branch.
+    const maxPerBranch = mode === 'full' || itemsLimit < 0 ? -1 : Math.max(itemsLimit, 1);
+    const outputData = mergeRunBranches(nodeData, 'data', maxPerBranch);
+
     if (mode === 'full') {
       nodeResult.data = {
-        output: firstRun.data?.main || [],
+        output: outputData,
         metadata: {
           totalItems: itemCounts.output,
           itemsShown: itemCounts.output,
           truncated: false,
         },
       };
-
-      if (includeInputData && firstRun.inputData) {
-        nodeResult.data.input = firstRun.inputData;
-      }
     } else {
-      // Summary or filtered mode - apply limits
-      const outputData = firstRun.data?.main || [];
-      const { truncated, metadata } = truncateItems(outputData, itemsLimit);
+      // Summary or filtered mode - apply item limits
+      const { truncated, metadata } = truncateItems(outputData, itemsLimit, itemCounts.output);
 
       if (metadata.truncated) {
         hasMoreData = true;
@@ -505,9 +525,19 @@ export function filterExecutionData(
         output: truncated,
         metadata,
       };
+    }
 
-      if (includeInputData && firstRun.inputData) {
-        nodeResult.data.input = firstRun.inputData;
+    if (includeInputData && itemCounts.input > 0) {
+      const inputData = mergeRunBranches(nodeData, 'inputOverride', maxPerBranch);
+      if (mode === 'full') {
+        nodeResult.data.input = inputData;
+      } else {
+        const { truncated, metadata } = truncateItems(inputData, itemsLimit, itemCounts.input);
+        if (metadata.truncated) {
+          hasMoreData = true;
+        }
+        nodeResult.data.input = truncated;
+        nodeResult.data.inputMetadata = metadata;
       }
     }
 

@@ -36,11 +36,11 @@ export const n8nExecutionsDoc: ToolDocumentation = {
 - Provides AI-friendly fix suggestions based on error patterns
 - Token-efficient (80-90% smaller than full mode)`,
     parameters: {
-      action: { type: 'string', required: true, description: 'Operation: "get", "list", or "delete"' },
-      id: { type: 'string', required: false, description: 'Execution ID (required for action=get or action=delete)' },
+      action: { type: 'string', required: false, description: 'Operation: "get", "list" (default), or "delete". "get" without an id lists executions instead' },
+      id: { type: 'string', required: false, description: 'Execution ID. Required for action=delete; for action=get, omitting it lists executions instead' },
       mode: { type: 'string', required: false, description: 'For action=get: "preview", "summary" (default), "filtered", "full", "error"' },
       nodeNames: { type: 'array', required: false, description: 'For action=get with mode=filtered: Filter to specific nodes by name' },
-      itemsLimit: { type: 'number', required: false, description: 'For action=get with mode=filtered: Items per node (0=structure, 2=default, -1=unlimited)' },
+      itemsLimit: { type: 'number', required: false, description: 'For action=get with mode=summary or filtered: Items per node (0=structure, 2=default, -1=unlimited); applies to input data too when includeInputData is set' },
       includeInputData: { type: 'boolean', required: false, description: 'For action=get: Include input data in addition to output (default: false)' },
       errorItemsLimit: { type: 'number', required: false, description: 'For action=get with mode=error: Sample items from upstream (default: 2, max: 100)' },
       includeStackTrace: { type: 'boolean', required: false, description: 'For action=get with mode=error: Include full stack trace (default: false, shows truncated)' },
@@ -54,7 +54,7 @@ export const n8nExecutionsDoc: ToolDocumentation = {
       includeData: { type: 'boolean', required: false, description: 'For action=list: Include execution data (default: false)' }
     },
     returns: `Depends on action:
-- get (error mode): { errorInfo: { primaryError, upstreamContext, executionPath, suggestions }, summary }
+- get (error mode): { errorInfo: { primaryError, upstreamContext, executionPath, suggestions }, summary }; when n8n recorded no error (e.g. a successful execution), errorInfo is omitted and errorInfoNote says why. When n8n recorded a node error on an execution that succeeded, errorInfo is present and errorInfoNote says the error did not stop the workflow
 - get (other modes): Execution object with data based on mode
 - list: { data: [...executions], nextCursor?: string }
 - delete: { success: boolean, message: string }`,
