@@ -40,7 +40,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30  # fork: upstream's 15 min is borderline for the full suite on ubuntu-latest (14.5 min upstream)
+    timeout-minutes: 60  # fork: the unit suite alone takes ~27 min on ubuntu-latest here, UI browser tests follow
     env:
       # A boolean flag (not the secrets themselves) recording whether a live n8n
       # instance is configured, so the live-integration step can gate on it without
