@@ -7,13 +7,12 @@
  *
  * Memory impact: Reduces per-session memory from ~900MB to near-zero by sharing
  * a single ~68MB database connection across all sessions.
- *
- * Issue: https://github.com/czlonkowski/n8n-mcp/issues/XXX
  */
 
 import path from 'path';
 import { DatabaseAdapter, createDatabaseAdapter } from './database-adapter';
 import { NodeRepository } from './node-repository';
+import { migrateWorkflowVersionsInstanceId } from './migrations/add-workflow-versions-instance-id';
 import { TemplateService } from '../templates/template-service';
 import { EnhancedConfigValidator } from '../services/enhanced-config-validator';
 import { logger } from '../utils/logger';
@@ -107,7 +106,14 @@ async function initializeSharedDatabase(dbPath: string): Promise<SharedDatabaseS
   logger.info('Initializing shared database connection', { dbPath });
 
   const db = await createDatabaseAdapter(dbPath);
+
+  // Ensure workflow_versions is tenant-scoped (GHSA-j6r7-6fhx-77wx). File-based
+  // databases do not re-run schema.sql, so upgrade in place here, then trim
+  // backups past the retention window.
+  migrateWorkflowVersionsInstanceId(db);
+
   const repository = new NodeRepository(db);
+  repository.pruneExpiredWorkflowVersions();
   const templateService = new TemplateService(db);
 
   // Initialize similarity services for enhanced validation

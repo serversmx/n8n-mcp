@@ -27,11 +27,8 @@ export function isExpression(value: unknown): value is string {
  * @returns true if the value contains {{ }} markers
  */
 export function containsExpression(value: unknown): boolean {
-  if (typeof value !== 'string') {
-    return false;
-  }
-  // Use single regex for better performance than two includes()
-  return /\{\{.*\}\}/s.test(value);
+  // SECURITY (GHSA-xvxq-x6hr-xc2c): linear scan instead of an unanchored regex
+  return hasBracketExpression(value);
 }
 
 /**
@@ -101,6 +98,24 @@ export function extractBracketExpressions(value: string): string[] {
     i = end + 2;
   }
   return results;
+}
+
+/**
+ * Detect a '{{' that has no matching '}}' anywhere after it, using the same
+ * left-to-right pairing n8n's renderer applies. Leftover braces without a
+ * dangling open (JSON bodies, Graph-API field syntax, stray '}}') render as
+ * literal text and are not flagged.
+ */
+export function hasDanglingOpenBracket(value: string): boolean {
+  let cursor = 0;
+  while (cursor < value.length) {
+    const start = value.indexOf('{{', cursor);
+    if (start === -1) return false;
+    const end = value.indexOf('}}', start + 2);
+    if (end === -1) return true;
+    cursor = end + 2;
+  }
+  return false;
 }
 
 /**

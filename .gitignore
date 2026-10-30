@@ -24,6 +24,9 @@ out/
 .cache/
 .parcel-cache/
 
+# MCPB bundle (built artifact — produced by `mcpb pack`, attached to releases)
+*.mcpb
+
 # IDE and editor files
 .vscode/
 .idea/
@@ -139,6 +142,9 @@ n8n-mcp-wrapper.sh
 # MCP configuration files (all variants: .mcp.json, .mcp.json.bk, .mcp.json.bak, etc.)
 .mcp.json*
 
+# Local Codex MCP configuration can contain credentials
+.codex/config.toml
+
 # UI Apps build output
 ui-apps/dist/
 ui-apps/node_modules/
@@ -158,3 +164,9 @@ N8N_WORKFLOW_SMOKE.md
 WORKFLOW_BUILDER_RULES.md
 /workflows/
 docs/RUNBOOK-MCP-HTTP.md
+
+# Local UI protocol snapshots and test artifacts
+ui-apps/.lab-smoke.json
+ui-apps/coverage/
+ui-apps/test-results/
+ui-apps/playwright-report/

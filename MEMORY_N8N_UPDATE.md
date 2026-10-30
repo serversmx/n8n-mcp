@@ -4,10 +4,9 @@
 
 **CRITICAL FIRST STEP**: Check existing releases to avoid version conflicts!
 
-**IMPORTANT: Community nodes are preserved incrementally!**
-- `npm run update:n8n` rebuilds the base node DB (wipes community nodes temporarily)
-- Community nodes must be backed up BEFORE and restored AFTER the base rebuild
-- `npm run fetch:community` now upserts by default (preserves READMEs + AI summaries)
+**IMPORTANT: Community nodes are preserved automatically!**
+- `npm run update:n8n` rebuilds the base node DB; the rebuild now skips rows where `is_community = 1`, so community nodes survive automatically (no manual backup/restore needed)
+- `npm run fetch:community` upserts by default (preserves READMEs + AI summaries) — run it to refresh/add community nodes, not to recover them
 - `npm run generate:docs:incremental` only processes nodes missing docs
 - Use `generate:docs:readme-only` first, then `generate:docs:summary-only` with a local LLM
 
@@ -22,20 +21,15 @@ git checkout main && git pull
 # 3. Check for updates (dry run)
 npm run update:n8n:check
 
-# 4. Back up community nodes BEFORE update (update:n8n rebuilds base DB!)
-sqlite3 data/nodes.db ".mode insert nodes" "SELECT * FROM nodes WHERE is_community = 1;" > /tmp/n8n_community_backup.sql
-
-# 5. Run update and skip tests (we'll test in CI)
+# 4. Run update and skip tests (we'll test in CI)
+# The rebuild preserves community nodes automatically (is_community = 1 rows are not wiped).
 yes y | npm run update:n8n
 
-# 6. Restore community nodes after rebuild
-sqlite3 data/nodes.db < /tmp/n8n_community_backup.sql
-
-# 7. Refresh community nodes (upserts - preserves existing READMEs + AI summaries!)
+# 5. Refresh community nodes (upserts - preserves existing READMEs + AI summaries!)
 npm run fetch:community
 # NOTE: Default mode is now "upsert" - no deletion. Use --rebuild for clean slate.
 
-# 8. Generate docs incrementally (only for new/missing nodes)
+# 6. Generate docs incrementally (only for new/missing nodes)
 npm run generate:docs:readme-only              # Fetch READMEs from npm (no LLM needed)
 # Then with a local LLM server running (LM Studio, vLLM, Ollama):
 N8N_MCP_LLM_BASE_URL="http://YOUR_SERVER:PORT/v1" \
@@ -44,23 +38,31 @@ node dist/scripts/generate-community-docs.js --summary-only --skip-existing-summ
 # For vLLM with thinking models, the code auto-sends chat_template_kwargs: {enable_thinking: false}
 # Context length needed: 8K minimum (README truncated to 6000 chars, output max 2000 tokens)
 
-# 9. Create feature branch
+# 6b. Check the database size (GitHub rejects files over 100 MiB; the push fails with a bare
+# "pre-receive hook declined"). The rebuild already runs VACUUM, prints the size and throws at
+# 100 MiB, but fetch:community and the docs generators write rows after it, so check again:
+sqlite3 data/nodes.db 'VACUUM'
+ls -l data/nodes.db | awk '{ printf "%.1f MiB\n", $5 / 1048576 }'   # must be well under 100 (MiB, not MB)
+# Bulk columns (nodes.properties_schema, nodes.npm_readme, node_versions.properties_schema)
+# are stored gzip+base64 (#1067); `node dist/scripts/rebuild.js` rewrites any plain rows.
+
+# 7. Create feature branch
 git checkout -b update/n8n-X.X.X
 
-# 10. Update version in package.json (must be HIGHER than latest release!)
+# 8. Update version in package.json (must be HIGHER than latest release!)
 # Edit: "version": "2.XX.X" (not the version from the release list!)
 
-# 11. Update CHANGELOG.md
+# 9. Update CHANGELOG.md
 # - Change version number to match package.json
 # - Update date to today
 # - Update dependency versions
 # - Include community node refresh counts
 
-# 12. Update README badge and node counts
+# 10. Update README badge and node counts
 # Edit line 8: Change n8n version badge to new n8n version
 # Update total node count in description (core + community)
 
-# 13. Commit and push
+# 11. Commit and push
 git add -A
 git commit -m "chore: update n8n to X.X.X and bump version to 2.XX.X
 
@@ -81,10 +83,10 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 
 git push -u origin update/n8n-X.X.X
 
-# 14. Create PR
+# 12. Create PR
 gh pr create --title "chore: update n8n to X.X.X" --body "Updates n8n and all related dependencies to the latest versions..."
 
-# 15. After PR is merged, verify release triggered
+# 13. After PR is merged, verify release triggered
 gh release list | head -1
 # If the new version appears, you're done!
 # If not, the version might have already been released - bump version again and create new PR
@@ -110,6 +112,24 @@ gh release list | head -1
 **Problem**: CI takes 8+ minutes
 **Reason**: Integration tests need live n8n instance (slow)
 **Normal**: Unit tests (~2 min) + integration tests (~6 min) = ~8 min total
+
+**Problem**: `npm run update:n8n` stops at the database rebuild with `no such module: fts5`, after a warning that better-sqlite3 was compiled against a different Node.js version
+**Cause**: npm 11 skips the install scripts of packages not covered by `allowScripts`, so `npm install` does not recompile better-sqlite3 for the current Node.js and the rebuild falls back to sql.js, which has no FTS5
+**Solution**: `npm rebuild better-sqlite3`, then `npm run build && npm run rebuild && npm run validate`
+
+**Problem**: `npm run fetch:community` aborts (exit 134) with `Assertion failed: (env) != nullptr` in `RemoveEnvironmentCleanupHook`, while fetching or saving nodes
+**Cause**: better-sqlite3 11.10 crashes in a statement destructor during garbage collection under Node.js 24.21. Forcing sql.js does not help: the community fetch writes to FTS5-indexed tables, which sql.js lacks
+**Solution**: run the community fetch and the docs generators under Node.js 22, then recompile for the default Node.js. The fetch upserts, so re-running it after an abort is safe; check `sqlite3 data/nodes.db 'pragma integrity_check'` first
+```bash
+PATH=/opt/homebrew/opt/node@22/bin:$PATH npm rebuild better-sqlite3
+PATH=/opt/homebrew/opt/node@22/bin:$PATH node dist/scripts/fetch-community-nodes.js
+# generate-community-docs.js runs the same way
+npm rebuild better-sqlite3   # back to the default Node.js
+```
+
+**Problem**: `generate:docs:readme-only` exits with code 1
+**Reason**: Some packages have no README anywhere (the fetch reads the tarball when the registry metadata has none) or are no longer on npm
+**Normal**: A few failed fetches are expected; check the "With README" count instead of the exit code
 
 ## Quick One-Command Update
 

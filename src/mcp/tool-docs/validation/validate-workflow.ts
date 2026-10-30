@@ -70,14 +70,16 @@ export const validateWorkflowDoc: ToolDocumentation = {
       'Validate after any workflow modifications, especially connection changes',
       'Check statistics to understand workflow complexity',
       '**Auto-sanitization runs during create/update**: Operator structures and missing metadata are automatically fixed when workflows are created or updated, but validation helps catch issues before they reach n8n',
-      'If validation detects operator issues, they will be auto-fixed during n8n_create_workflow or n8n_update_partial_workflow'
+      'If validation detects operator issues, they will be auto-fixed during n8n_create_workflow or n8n_update_partial_workflow',
+      'A short Code node that only maps fields, collects or splits lists, filters, sorts, dedupes, totals or makes one request gets a NATIVE_ALTERNATIVE warning (ai-friendly, strict) or suggestion (runtime) naming the native node. When the Code node is needed, start its notes with "Why Code:" and the reason'
     ],
     pitfalls: [
       'Large workflows (100+ nodes) may take longer to validate',
       'Expression validation requires proper node references to exist',
       'Some warnings may be acceptable depending on use case',
       'Validation cannot catch all runtime errors (e.g., API failures)',
-      'Profile setting only affects node validation, not connection/expression checks'
+      'Profile setting only affects node validation, not connection/expression checks',
+      'A DEPRECATED_NODE warning (Function, Function Item, LangChain Code) means n8n 2.44+ rejects saving the workflow if that node was added or edited; an untouched existing one is accepted'
     ],
     relatedTools: ['validate_node', 'n8n_create_workflow', 'n8n_update_partial_workflow', 'n8n_autofix_workflow']
   }

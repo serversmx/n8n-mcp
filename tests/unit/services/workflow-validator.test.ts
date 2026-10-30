@@ -79,6 +79,222 @@ describe('WorkflowValidator', () => {
       expect(result.statistics.triggerNodes).toBe(1);
     });
 
+    describe('malformed node entries (#1071)', () => {
+      const goodNode = { id: '1', name: 'Webhook', type: 'n8n-nodes-base.webhook', typeVersion: 2, position: [0, 0] as [number, number], parameters: {} };
+
+      // Before the shape check these threw several passes in, and the single try/catch around
+      // the run turned each one into "Workflow validation failed: <TypeError>" with every
+      // other check skipped.
+      it.each([
+        { label: 'a string', node: 'strayString', expected: /Node at index 1 is not an object \(received a string\)/ },
+        { label: 'null', node: null, expected: /Node at index 1 is not an object \(received null\)/ },
+        { label: 'an array', node: [], expected: /Node at index 1 is not an object \(received an array\)/ },
+        { label: 'a non-string type', node: { ...goodNode, id: '2', name: 'Bad', type: 123 }, expected: /Node "Bad" has a non-string "type"/ },
+        { label: 'a missing type', node: { id: '2', name: 'NoType', typeVersion: 2, position: [200, 0], parameters: {} }, expected: /Node "NoType" has a non-string "type" \(received nothing\)/ },
+        { label: 'missing parameters', node: { id: '2', name: 'NoParams', type: 'n8n-nodes-base.set', typeVersion: 3, position: [200, 0] }, expected: /Node "NoParams" has no "parameters"/ },
+        // A present name must be a string even though an absent one is allowed: the structure
+        // checks index connections[node.name], which coerces the key.
+        { label: 'an object name', node: { ...goodNode, id: '2', name: { toString: null } }, expected: /Node at index 1 has a non-string "name" \(received an object\)/ },
+        { label: 'a numeric name', node: { ...goodNode, id: '2', name: 123 }, expected: /Node at index 1 has a non-string "name" \(received a number\)/ },
+        { label: 'a null name', node: { ...goodNode, id: '2', name: null }, expected: /Node at index 1 has a non-string "name" \(received null\)/ },
+        { label: 'undefined parameters', node: { id: '2', name: 'UndefParams', type: '@n8n/n8n-nodes-langchain.agent', typeVersion: 1, position: [200, 0], parameters: undefined }, expected: /Node "UndefParams" has undefined "parameters"/ },
+        // null is what the AI-node checks dereference (node.parameters.hasOutputParser).
+        { label: 'null parameters', node: { id: '2', name: 'NullParams', type: '@n8n/n8n-nodes-langchain.agent', typeVersion: 1, position: [200, 0], parameters: null }, expected: /Node "NullParams" has null "parameters"/ },
+      ])('reports $label without leaking a TypeError', async ({ node, expected }) => {
+        const workflow = { name: 'Malformed', nodes: [goodNode, node], connections: {} };
+
+        const result = await validator.validateWorkflow(workflow as any);
+
+        expect(result.valid).toBe(false);
+        expect(result.errors.some(e => expected.test(e.message))).toBe(true);
+        expect(result.errors.some(e => /Cannot read propert|is not a function|Workflow validation failed:/.test(e.message))).toBe(false);
+      });
+
+      // The gate is deliberately narrower than n8n's node schema: this tool validates drafts,
+      // so an incomplete node must still reach the passes that explain what it is missing.
+      it('still gives a draft node its normal feedback instead of a shape error', async () => {
+        const workflow = {
+          name: 'Draft',
+          nodes: [goodNode, { name: 'Set', type: 'n8n-nodes-base.set', parameters: {} }],
+          connections: { Webhook: { main: [[{ node: 'Set', type: 'main', index: 0 }]] } },
+        };
+
+        const result = await validator.validateWorkflow(workflow as any);
+
+        expect(result.errors.some(e => /is not an object|has a non-string "type"|has no "parameters"/.test(e.message))).toBe(false);
+        expect(result.errors.some(e => /position/i.test(e.message))).toBe(true);
+      });
+    });
+
+    describe('malformed connection entries (#1094)', () => {
+      const webhook = { id: '1', name: 'Webhook', type: 'n8n-nodes-base.webhook', typeVersion: 2, position: [0, 0] as [number, number], parameters: {} };
+      const set = { id: '2', name: 'Set', type: 'n8n-nodes-base.set', typeVersion: 3, position: [200, 0] as [number, number], parameters: {} };
+      const validate = (connections: unknown) =>
+        validator.validateWorkflow({ name: 'Connections', nodes: [webhook, set], connections } as any);
+
+      // Some of these threw mid-traversal and became "Workflow validation failed: <TypeError>",
+      // the only error the caller saw; the rest were skipped in silence by a local guard.
+      it.each([
+        { label: 'a null source entry', connections: { Webhook: null }, expected: /Connections for "Webhook" must be an object keyed by connection type \(received null\)/ },
+        { label: 'a string source entry', connections: { Webhook: 'main' }, expected: /Connections for "Webhook" must be an object keyed by connection type \(received a string\)/ },
+        { label: 'an array source entry', connections: { Webhook: [] }, expected: /Connections for "Webhook" must be an object keyed by connection type \(received an array\)/ },
+        { label: 'a null output', connections: { Webhook: { main: null } }, expected: /Connections for "Webhook" output "main" must be an array of output branches \(received null\)/ },
+        // Published n8n.io templates carry this one (workflow 6507), where it threw
+        // "outputConnections.forEach is not a function".
+        { label: 'a flattened branch', connections: { Webhook: { main: [{ node: 'Set', type: 'main', index: 0 }] } }, expected: /Output branch "Webhook"\.main\[0\] must be an array of connections \(received an object\)/ },
+        { label: 'a string branch', connections: { Webhook: { main: ['Set'] } }, expected: /Output branch "Webhook"\.main\[0\] must be an array of connections \(received a string\)/ },
+        { label: 'a null connection', connections: { Webhook: { main: [[null]] } }, expected: /Connection "Webhook"\.main\[0\]\[0\] must be an object \(received null\)/ },
+        { label: 'a non-string target', connections: { Webhook: { main: [[{ node: 5, type: 'main', index: 0 }]] } }, expected: /Connection "Webhook"\.main\[0\]\[0\] has a non-string "node" \(received a number\)/ },
+        // JSON can express an object that throws when coerced, which is what the connection
+        // pass does to both fields - `connection.index < 0` and the invalid-type message.
+        { label: 'an object type', connections: { Webhook: { main: [[{ node: 'Set', type: { toString: null, valueOf: null }, index: 0 }]] } }, expected: /Connection "Webhook"\.main\[0\]\[0\] has a non-string "type" \(received an object\)/ },
+        { label: 'an object index', connections: { Webhook: { main: [[{ node: 'Set', type: 'main', index: { toString: null, valueOf: null } }]] } }, expected: /Connection "Webhook"\.main\[0\]\[0\] has a non-numeric "index" \(received an object\)/ },
+      ])('reports $label without leaking a TypeError', async ({ connections, expected }) => {
+        const result = await validate(connections);
+
+        expect(result.valid).toBe(false);
+        expect(result.errors.some(e => expected.test(e.message))).toBe(true);
+        expect(result.errors.some(e => /Cannot read propert|Cannot convert|is not a function|Workflow validation failed:/.test(e.message))).toBe(false);
+      });
+
+      // The expression pass reaches nodeHasInput, so switching connection validation off did
+      // not avoid the dereference.
+      it('reports the shape even when connection validation is switched off', async () => {
+        const result = await validator.validateWorkflow(
+          { name: 'Connections', nodes: [webhook, set], connections: { Webhook: null } } as any,
+          { validateConnections: false } as any
+        );
+
+        expect(result.errors.some(e => /Connections for "Webhook" must be an object/.test(e.message))).toBe(true);
+        expect(result.errors.some(e => /Workflow validation failed:/.test(e.message))).toBe(false);
+      });
+
+      it('reports every malformed branch in one pass', async () => {
+        const result = await validate({
+          Webhook: { main: [{ node: 'Set', type: 'main', index: 0 }, 'Set'] },
+        });
+
+        expect(result.errors.filter(e => /must be an array of connections/.test(e.message))).toHaveLength(2);
+      });
+
+      // Node findings do not depend on the connection shape, so they survive the gate.
+      it('still reports node problems alongside the connection shape', async () => {
+        const result = await validator.validateWorkflow({
+          name: 'Connections',
+          nodes: [webhook, { ...set, typeVersion: 99 }],
+          connections: { Webhook: { main: [[{ node: 5, type: 'main', index: 0 }]] } },
+        } as any);
+
+        expect(result.errors.some(e => /has a non-string "node"/.test(e.message))).toBe(true);
+        expect(result.errors.some(e => /typeVersion 99 exceeds/.test(e.message))).toBe(true);
+      });
+
+      // Deliberately shallower than the write-path schema: all of these validate here today,
+      // and the gate must not be what changes that.
+      it.each([
+        { label: 'a connection without type or index', connections: { Webhook: { main: [[{ node: 'Set' }]] } } },
+        { label: 'a stringified index', connections: { Webhook: { main: [[{ node: 'Set', type: 'main', index: '0' }]] } } },
+        { label: 'a nullish branch for an unconnected output', connections: { Webhook: { main: [[{ node: 'Set', type: 'main', index: 0 }], null] } } },
+        { label: 'an empty branch', connections: { Webhook: { main: [[]] } } },
+        { label: 'an empty output', connections: { Webhook: { main: [] } } },
+        { label: 'a source that matches no node', connections: { Nowhere: { main: [[{ node: 'Set', type: 'main', index: 0 }]] } } },
+        { label: 'an unknown output key', connections: { Webhook: { weird: [[{ node: 'Set', type: 'main', index: 0 }]] } } },
+        { label: 'an AI connection type', connections: { Webhook: { ai_tool: [[{ node: 'Set', type: 'ai_tool', index: 0 }]] } } },
+        // Scalars of the wrong kind coerce without throwing, and the connection pass already
+        // reports them - claiming them here would report the same problem twice.
+        { label: 'a numeric type', connections: { Webhook: { main: [[{ node: 'Set', type: 5, index: 0 }]] } } },
+      ])('accepts $label, as before', async ({ connections }) => {
+        const result = await validate(connections);
+
+        expect(result.errors.filter(e => e.code === 'MALFORMED_CONNECTION')).toHaveLength(0);
+      });
+
+      // Stronger than the code filter above, which a future gate could evade by reporting the
+      // same shapes under a different code: these have to come back clean, full stop.
+      it.each([
+        { label: 'a connection without type or index', connections: { Webhook: { main: [[{ node: 'Set' }]] } } },
+        { label: 'a stringified index', connections: { Webhook: { main: [[{ node: 'Set', type: 'main', index: '0' }]] } } },
+        { label: 'a nullish branch for an unconnected output', connections: { Webhook: { main: [[{ node: 'Set', type: 'main', index: 0 }], null] } } },
+      ])('validates a workflow with $label', async ({ connections }) => {
+        const result = await validate(connections);
+
+        expect(result.errors).toEqual([]);
+        expect(result.valid).toBe(true);
+      });
+
+      // Bundled template 6686 keys its connections under "output" AND flattens the branches.
+      // Reporting only the nesting would send the caller to fix the wrong thing.
+      it('names an invalid output key ahead of the shape errors under it', async () => {
+        const result = await validate({ Webhook: { output: [{ node: 'Set', type: 'main', index: 0 }] } });
+
+        const messages = result.errors.map(e => e.message);
+        expect(messages[0]).toMatch(/Unknown connection output key "output" on node "Webhook"/);
+        expect(messages[1]).toMatch(/Output branch "Webhook"\.output\[0\] must be an array of connections/);
+      });
+
+      // An unknown key and a missing source are validateConnections' job, and it still gets to
+      // do it: the gate does not claim them and does not stop the pass that reports them.
+      it.each([
+        { label: 'an unknown output key', connections: { Webhook: { weird: [[{ node: 'Set', type: 'main', index: 0 }]] } }, expected: /Unknown connection output key "weird"/ },
+        { label: 'a source that matches no node', connections: { Nowhere: { main: [[{ node: 'Set', type: 'main', index: 0 }]] } }, expected: /Connection from non-existent node: "Nowhere"/ },
+      ])('still reports $label from the connection pass', async ({ connections, expected }) => {
+        const result = await validate(connections);
+
+        expect(result.errors.some(e => expected.test(e.message))).toBe(true);
+      });
+
+      // Nothing dereferences a null output map today, so this one is a new report rather than a
+      // fixed throw - kept because n8n's write schema rejects it and silence would mislead.
+      it('reports a null output map that was previously passed over in silence', async () => {
+        const result = await validate({ Webhook: { main: null } });
+
+        expect(result.errors.some(e => e.code === 'MALFORMED_CONNECTION')).toBe(true);
+      });
+
+      // A non-array output value (here `{}` instead of an array of branches) is malformed but
+      // still a real, present value under a real key, so it counts toward the empty-connections
+      // check (#1101) - unlike a fully-null source value, which collapses to nothing there.
+      // Only the shape error should speak.
+      it('reports the shape error for a malformed (non-array) output value without also claiming no connections', async () => {
+        const result = await validate({ Webhook: { output: {} } });
+
+        expect(result.errors.some(e => e.code === 'MALFORMED_CONNECTION')).toBe(true);
+        expect(result.errors.some(e => /Multi-node workflow has no connections/.test(e.message))).toBe(false);
+      });
+
+      // The code is internal - the MCP response maps errors to {node, message, details} and
+      // drops it, as it does for every other code. What the caller sees is the ordering: the
+      // shape errors are pushed before any pass runs, so they arrive first.
+      //
+      // A real connection from Set is included so the empty-connections check (#1101, which
+      // now requires a source key to name an actual target) does not also fire and take
+      // errors[0] - Webhook's own value is still the fully-malformed `null` under test.
+      it('tags shape errors with a code and reports them ahead of node findings', async () => {
+        const result = await validator.validateWorkflow({
+          name: 'Connections',
+          nodes: [webhook, { ...set, typeVersion: 99 }],
+          connections: { Webhook: null, Set: { main: [[{ node: 'Webhook', type: 'main', index: 0 }]] } },
+        } as any);
+
+        expect(result.errors[0].code).toBe('MALFORMED_CONNECTION');
+        expect(result.errors.at(-1)!.message).toMatch(/typeVersion 99 exceeds/);
+      });
+
+      // Without any real target anywhere, a fully-malformed source value (`null`) is not enough
+      // to count as "has connections" - the empty-connections error fires too, ahead of the
+      // shape error, because validateWorkflowStructure runs before the connections shape gate.
+      it('also reports the empty-connections error when nothing in the workflow names a real target', async () => {
+        const result = await validator.validateWorkflow({
+          name: 'Connections',
+          nodes: [webhook, set],
+          connections: { Webhook: null },
+        } as any);
+
+        expect(result.errors.some(e => /Multi-node workflow has no connections/.test(e.message))).toBe(true);
+        expect(result.errors.some(e => e.code === 'MALFORMED_CONNECTION')).toBe(true);
+      });
+    });
+
     it('should validate a workflow with all options disabled', async () => {
       const workflow = createWorkflow('Test Workflow').addWebhookNode({ name: 'Webhook' }).build();
       const result = await validator.validateWorkflow(workflow as any, { validateNodes: false, validateConnections: false, validateExpressions: false });
@@ -237,8 +453,10 @@ describe('WorkflowValidator', () => {
 
   describe('validateAllNodes', () => {
     it('should skip disabled nodes', async () => {
-      await validator.validateWorkflow({ nodes: [{ id: '1', name: 'Webhook', type: 'n8n-nodes-base.webhook', position: [100, 100], parameters: {}, disabled: true }], connections: {} } as any);
-      expect(mockNodeRepository.getNode).not.toHaveBeenCalled();
+      const result = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'Webhook', type: 'n8n-nodes-base.webhook', position: [100, 100], parameters: {}, disabled: true }], connections: {} } as any);
+      // The only lookup is the deprecated-node check, which n8n applies to disabled nodes too
+      expect(mockNodeRepository.getNode).toHaveBeenCalledTimes(1);
+      expect(result.errors.filter(e => e.nodeName === 'Webhook')).toEqual([]);
     });
 
     it('should accept both nodes-base and n8n-nodes-base prefixes', async () => {
@@ -274,9 +492,16 @@ describe('WorkflowValidator', () => {
       expect(result.errors.some(e => e.message.includes('Invalid typeVersion: invalid'))).toBe(true);
     });
 
-    it('should warn for outdated typeVersion', async () => {
-      const result = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'Webhook', type: 'n8n-nodes-base.webhook', position: [100, 100], parameters: {}, typeVersion: 1 }], connections: {} } as any);
-      expect(result.warnings.some(w => w.message.includes('Outdated typeVersion: 1. Latest is 2'))).toBe(true);
+    it('should suggest (not warn) for outdated typeVersion under advisory profiles only', async () => {
+      // Advisory profile: demoted to a suggestion
+      const aiFriendly = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'Webhook', type: 'n8n-nodes-base.webhook', position: [100, 100], parameters: {}, typeVersion: 1 }], connections: {} } as any, { profile: 'ai-friendly' });
+      expect(aiFriendly.warnings.some(w => w.message.includes('Outdated typeVersion'))).toBe(false);
+      expect(aiFriendly.suggestions.some(s => s.includes('Outdated typeVersion') && s.includes('Latest is 2'))).toBe(true);
+
+      // Default runtime profile: silent (old typeVersions are supported by design)
+      const runtime = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'Webhook', type: 'n8n-nodes-base.webhook', position: [100, 100], parameters: {}, typeVersion: 1 }], connections: {} } as any);
+      expect(runtime.warnings.some(w => w.message.includes('Outdated typeVersion'))).toBe(false);
+      expect(runtime.suggestions.some(s => s.includes('Outdated typeVersion'))).toBe(false);
     });
 
     it('should error for typeVersion exceeding maximum', async () => {
@@ -428,8 +653,12 @@ describe('WorkflowValidator', () => {
     });
 
     it('should validate AI tool connections', async () => {
-      const result = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'Agent', type: '@n8n/n8n-nodes-langchain.agent', position: [100, 100], parameters: {} }, { id: '2', name: 'Tool', type: 'n8n-nodes-base.httpRequest', position: [300, 100], parameters: {} }], connections: { 'Agent': { ai_tool: [[{ node: 'Tool', type: 'main', index: 0 }]] } } } as any);
+      // Tools are the ai_tool SOURCE; the agent receives the connection. A
+      // langchain tool node keeps this a pure statistics test - the invalid
+      // source case is pinned in the Tool Variant Validation suite.
+      const result = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'Agent', type: '@n8n/n8n-nodes-langchain.agent', position: [100, 100], parameters: {} }, { id: '2', name: 'Tool', type: '@n8n/n8n-nodes-langchain.toolCalculator', position: [300, 100], parameters: {} }], connections: { 'Tool': { ai_tool: [[{ node: 'Agent', type: 'ai_tool', index: 0 }]] } } } as any);
       expect(result.statistics.validConnections).toBe(1);
+      expect(result.errors.filter(e => (e as any).code === 'INVALID_AI_TOOL_SOURCE')).toHaveLength(0);
     });
 
     it('should warn for orphaned nodes', async () => {
@@ -437,9 +666,10 @@ describe('WorkflowValidator', () => {
       expect(result.warnings.some(w => w.message.includes('not reachable from any trigger node') && w.nodeName === 'Orphaned')).toBe(true);
     });
 
-    it('should detect cycles in workflow', async () => {
+    it('should detect cycles in workflow as a warning (n8n does not reject cycles statically)', async () => {
       const result = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'Node1', type: 'n8n-nodes-base.set', position: [100, 100], parameters: {} }, { id: '2', name: 'Node2', type: 'n8n-nodes-base.set', position: [300, 100], parameters: {} }, { id: '3', name: 'Node3', type: 'n8n-nodes-base.set', position: [500, 100], parameters: {} }], connections: { 'Node1': { main: [[{ node: 'Node2', type: 'main', index: 0 }]] }, 'Node2': { main: [[{ node: 'Node3', type: 'main', index: 0 }]] }, 'Node3': { main: [[{ node: 'Node1', type: 'main', index: 0 }]] } } } as any);
-      expect(result.errors.some(e => e.message.includes('Workflow contains a cycle'))).toBe(true);
+      expect(result.warnings.some(w => w.message.includes('Workflow contains a cycle'))).toBe(true);
+      expect(result.errors.some(e => e.message.includes('Workflow contains a cycle'))).toBe(false);
     });
 
     it('should handle null connections properly', async () => {
@@ -448,7 +678,7 @@ describe('WorkflowValidator', () => {
     });
 
     it('should continue validation after encountering errors', async () => {
-      const result = await validator.validateWorkflow({ nodes: [{ id: '1', name: null as any, type: 'n8n-nodes-base.set', position: [0, 0], parameters: {} }, { id: '2', name: 'Valid', type: 'n8n-nodes-base.set', position: [100, 0], parameters: {} }, { id: '3', name: 'AlsoValid', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} }], connections: { 'Valid': { main: [[{ node: 'AlsoValid', type: 'main', index: 0 }]] } } } as any);
+      const result = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'Unknown Type', type: 'n8n-nodes-base.doesNotExist', position: [0, 0], parameters: {} }, { id: '2', name: 'Valid', type: 'n8n-nodes-base.set', position: [100, 0], parameters: {} }, { id: '3', name: 'AlsoValid', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} }], connections: { 'Valid': { main: [[{ node: 'AlsoValid', type: 'main', index: 0 }]] } } } as any);
       expect(result.errors.length).toBeGreaterThan(0);
       expect(result.statistics.validConnections).toBeGreaterThan(0);
     });
@@ -534,41 +764,119 @@ describe('WorkflowValidator', () => {
         connections: {}
       });
 
-      for (const profile of ['runtime', 'ai-friendly', 'strict'] as const) {
+      for (const profile of ['ai-friendly', 'strict'] as const) {
         const result = await validator.validateWorkflow(buildAirtableWorkflow() as any, { profile });
         const cachedNameWarnings = result.warnings.filter(w => w.message.includes('cachedResultName'));
         expect(cachedNameWarnings.length, `profile=${profile}`).toBe(2);
       }
 
-      const minimalResult = await validator.validateWorkflow(buildAirtableWorkflow() as any, { profile: 'minimal' });
-      const minimalCachedNameWarnings = minimalResult.warnings.filter(w => w.message.includes('cachedResultName'));
-      expect(minimalCachedNameWarnings).toHaveLength(0);
+      // UI-guidance only — suppressed under minimal and runtime (audit noise fix)
+      for (const profile of ['minimal', 'runtime'] as const) {
+        const result = await validator.validateWorkflow(buildAirtableWorkflow() as any, { profile });
+        const cachedNameWarnings = result.warnings.filter(w => w.message.includes('cachedResultName'));
+        expect(cachedNameWarnings.length, `profile=${profile}`).toBe(0);
+      }
     });
   });
 
   // ─── Error Handler Detection ───────────────────────────────────────
 
   describe('Error Handler Detection', () => {
-    it('should identify error handlers by node name patterns', async () => {
+    // The hard "Incorrect error output configuration" error is gone (#1111). A fan-out to a
+    // node named like an error handler is only worth a note when the source also routes
+    // failures to an error output that nothing is wired to.
+    it('warns when onError routes to an unwired error output and main[0] fans out to a node named like an error handler', async () => {
       for (const errorName of ['Error Handler', 'Handle Error', 'Catch Exception', 'Failure Response']) {
-        const result = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'Source', type: 'n8n-nodes-base.httpRequest', position: [0, 0], parameters: {} }, { id: '2', name: 'Success', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} }, { id: '3', name: errorName, type: 'n8n-nodes-base.set', position: [200, 100], parameters: {} }], connections: { 'Source': { main: [[{ node: 'Success', type: 'main', index: 0 }, { node: errorName, type: 'main', index: 0 }]] } } } as any);
-        expect(result.errors.some(e => e.message.includes('Incorrect error output configuration') && e.message.includes(errorName))).toBe(true);
-      }
-    });
-
-    it('should not flag success node names as error handlers', async () => {
-      for (const name of ['Process Data', 'Transform', 'Normal Flow']) {
-        const result = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'Source', type: 'n8n-nodes-base.httpRequest', position: [0, 0], parameters: {} }, { id: '2', name: 'First', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} }, { id: '3', name: name, type: 'n8n-nodes-base.set', position: [200, 100], parameters: {} }], connections: { 'Source': { main: [[{ node: 'First', type: 'main', index: 0 }, { node: name, type: 'main', index: 0 }]] } } } as any);
+        const result = await validator.validateWorkflow({
+          nodes: [
+            { id: '1', name: 'Source', type: 'n8n-nodes-base.httpRequest', position: [0, 0], parameters: {}, onError: 'continueErrorOutput' },
+            { id: '2', name: 'Success', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} },
+            { id: '3', name: errorName, type: 'n8n-nodes-base.set', position: [200, 100], parameters: {} },
+          ],
+          connections: { 'Source': { main: [[{ node: 'Success', type: 'main', index: 0 }, { node: errorName, type: 'main', index: 0 }]] } },
+        } as any);
+        expect(
+          result.warnings.some(w =>
+            w.message.includes("onError: 'continueErrorOutput' but the error output (main[1]) is not connected") &&
+            w.message.includes(errorName)
+          ),
+          `errorName=${errorName}`
+        ).toBe(true);
         expect(result.errors.some(e => e.message.includes('Incorrect error output configuration'))).toBe(false);
       }
     });
 
-    it('should generate valid JSON in error messages', async () => {
-      const result = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'API Call', type: 'n8n-nodes-base.httpRequest', position: [0, 0], parameters: {} }, { id: '2', name: 'Success', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} }, { id: '3', name: 'Error Handler', type: 'n8n-nodes-base.respondToWebhook', position: [200, 100], parameters: {} }], connections: { 'API Call': { main: [[{ node: 'Success', type: 'main', index: 0 }, { node: 'Error Handler', type: 'main', index: 0 }]] } } } as any);
-      const errorMsg = result.errors.find(e => e.message.includes('Incorrect error output configuration'));
-      expect(errorMsg).toBeDefined();
-      expect(errorMsg!.message).toContain('INCORRECT (current):');
-      expect(errorMsg!.message).toContain('CORRECT (should be):');
+    it('does not warn about success node names even when onError routes to an unwired error output', async () => {
+      for (const name of ['Process Data', 'Transform', 'Normal Flow']) {
+        const result = await validator.validateWorkflow({
+          nodes: [
+            { id: '1', name: 'Source', type: 'n8n-nodes-base.httpRequest', position: [0, 0], parameters: {}, onError: 'continueErrorOutput' },
+            { id: '2', name: 'First', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} },
+            { id: '3', name: name, type: 'n8n-nodes-base.set', position: [200, 100], parameters: {} },
+          ],
+          connections: { 'Source': { main: [[{ node: 'First', type: 'main', index: 0 }, { node: name, type: 'main', index: 0 }]] } },
+        } as any);
+        expect(result.warnings.some(w => w.message.includes('named like an error handler'))).toBe(false);
+      }
+    });
+
+    it('does not warn when onError is not set, even with a fan-out named like an error handler', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: [
+          { id: '1', name: 'Source', type: 'n8n-nodes-base.httpRequest', position: [0, 0], parameters: {} },
+          { id: '2', name: 'Success', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} },
+          { id: '3', name: 'Handle Error', type: 'n8n-nodes-base.set', position: [200, 100], parameters: {} },
+        ],
+        connections: { 'Source': { main: [[{ node: 'Success', type: 'main', index: 0 }, { node: 'Handle Error', type: 'main', index: 0 }]] } },
+      } as any);
+      expect(result.warnings.some(w => w.message.includes('named like an error handler'))).toBe(false);
+    });
+
+    it('does not warn when the error output is already wired', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: [
+          { id: '1', name: 'Source', type: 'n8n-nodes-base.httpRequest', position: [0, 0], parameters: {}, onError: 'continueErrorOutput' },
+          { id: '2', name: 'Success', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} },
+          { id: '3', name: 'Handle Error', type: 'n8n-nodes-base.set', position: [200, 100], parameters: {} },
+          { id: '4', name: 'Real Error Handler', type: 'n8n-nodes-base.set', position: [200, 200], parameters: {} },
+        ],
+        connections: {
+          'Source': {
+            main: [
+              [{ node: 'Success', type: 'main', index: 0 }, { node: 'Handle Error', type: 'main', index: 0 }],
+              [{ node: 'Real Error Handler', type: 'main', index: 0 }],
+            ],
+          },
+        },
+      } as any);
+      expect(result.warnings.some(w => w.message.includes('named like an error handler'))).toBe(false);
+    });
+
+    // A Respond to Webhook beside a side-effect node in main[0] is an ordinary success path;
+    // node TYPE is no longer read as a signal, only the name (#1111).
+    it('does not warn about a Respond to Webhook node beside a side-effect node in main[0]', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: [
+          { id: '1', name: 'API Call', type: 'n8n-nodes-base.httpRequest', position: [0, 0], parameters: {}, onError: 'continueErrorOutput' },
+          { id: '2', name: 'Log Result', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} },
+          { id: '3', name: 'Respond', type: 'n8n-nodes-base.respondToWebhook', position: [200, 100], parameters: {} },
+        ],
+        connections: { 'API Call': { main: [[{ node: 'Log Result', type: 'main', index: 0 }, { node: 'Respond', type: 'main', index: 0 }]] } },
+      } as any);
+      expect(result.warnings.some(w => w.message.includes('named like an error handler'))).toBe(false);
+      expect(result.errors.some(e => e.message.includes('Incorrect error output configuration'))).toBe(false);
+    });
+
+    it('is not emitted under the minimal profile', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: [
+          { id: '1', name: 'Source', type: 'n8n-nodes-base.httpRequest', position: [0, 0], parameters: {}, onError: 'continueErrorOutput' },
+          { id: '2', name: 'Success', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} },
+          { id: '3', name: 'Handle Error', type: 'n8n-nodes-base.set', position: [200, 100], parameters: {} },
+        ],
+        connections: { 'Source': { main: [[{ node: 'Success', type: 'main', index: 0 }, { node: 'Handle Error', type: 'main', index: 0 }]] } },
+      } as any, { profile: 'minimal' });
+      expect(result.warnings.some(w => w.message.includes('named like an error handler'))).toBe(false);
     });
   });
 
@@ -576,9 +884,10 @@ describe('WorkflowValidator', () => {
 
   describe('onError Property Validation', () => {
     it('should validate onError property combinations', async () => {
-      // onError set but no error connections -> error
+      // onError set but error output unwired -> warning (n8n runs it; failed items are dropped)
       const r1 = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'Test', type: 'n8n-nodes-base.httpRequest', position: [0, 0], parameters: {}, onError: 'continueErrorOutput' }, { id: '2', name: 'Next', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} }], connections: { 'Test': { main: [[{ node: 'Next', type: 'main', index: 0 }]] } } } as any);
-      expect(r1.errors.some(e => e.message.includes("has onError: 'continueErrorOutput' but no error output connections"))).toBe(true);
+      expect(r1.warnings.some(w => w.message.includes("has onError: 'continueErrorOutput'") && w.message.includes('silently dropped'))).toBe(true);
+      expect(r1.errors.some(e => e.message.includes("onError: 'continueErrorOutput'"))).toBe(false);
 
       // error connections but no onError -> warning
       const r2 = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'Test', type: 'n8n-nodes-base.httpRequest', position: [0, 0], parameters: {} }, { id: '2', name: 'Success', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} }, { id: '3', name: 'ErrH', type: 'n8n-nodes-base.set', position: [200, 100], parameters: {} }], connections: { 'Test': { main: [[{ node: 'Success', type: 'main', index: 0 }], [{ node: 'ErrH', type: 'main', index: 0 }]] } } } as any);
@@ -591,33 +900,130 @@ describe('WorkflowValidator', () => {
         expect(result.errors.some(e => e.message.includes('but no error output connections'))).toBe(false);
       }
     });
+
+    // A conditional node's error output sits after its RULE outputs, not after a flat "main"
+    // count - getConditionalOutputInfo supplies that count, and fallbackOutput: 'extra' shifts
+    // it by one more.
+    it('describes a Switch with no outputs when a connection is out of bounds', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: [
+          { id: '1', name: 'Switch', type: 'n8n-nodes-base.switch', typeVersion: 3.2, position: [0, 0], parameters: { rules: { values: [] } } },
+          { id: '2', name: 'Next', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} },
+        ],
+        connections: { 'Switch': { main: [[{ node: 'Next', type: 'main', index: 0 }]] } },
+      } as any);
+      const error = result.errors.find(e => e.message.includes('exceeds its output count'));
+      expect(error?.message).toContain('no main outputs');
+      expect(error?.message).not.toContain('0--1');
+    });
+
+    it('does not count a connection with an empty target as a connection', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: [
+          { id: '1', name: 'A', type: 'n8n-nodes-base.set', position: [0, 0], parameters: {} },
+          { id: '2', name: 'B', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} },
+        ],
+        connections: { A: { main: [[{ node: '', type: 'main', index: 0 }]] } },
+      } as any);
+      expect(result.errors.some(e => e.message.includes('Multi-node workflow has no connections'))).toBe(true);
+    });
+
+    it('leaves a Switch in an unknown mode without an output count', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: [
+          { id: '1', name: 'Switch', type: 'n8n-nodes-base.switch', typeVersion: 3.2, position: [0, 0],
+            parameters: { mode: 'json', rules: { values: [{}] } } },
+          { id: '2', name: 'Next', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} },
+        ],
+        connections: { 'Switch': { main: [[], [], [], [{ node: 'Next', type: 'main', index: 0 }]] } },
+      } as any);
+      expect(result.errors.some(e => e.message.includes('exceeds its output count'))).toBe(false);
+    });
+
+    it('counts four outputs for a Switch v1 so its error output is main[4]', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: [
+          { id: '1', name: 'Switch', type: 'n8n-nodes-base.switch', typeVersion: 1, position: [0, 0], onError: 'continueErrorOutput',
+            parameters: { rules: { rules: [{ outputKey: 'a' }] } } },
+          { id: '2', name: 'Next', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} },
+        ],
+        connections: { 'Switch': { main: [[{ node: 'Next', type: 'main', index: 0 }], [], [], [{ node: 'Next', type: 'main', index: 0 }]] } },
+      } as any);
+      expect(result.errors.some(e => e.message.includes('exceeds its output count'))).toBe(false);
+      expect(result.warnings.some(w => w.nodeName === 'Switch' && w.message.includes('main[4]'))).toBe(true);
+    });
+
+    it('counts an expression-mode Switch by numberOutputs, ignoring a retained rule collection', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: [
+          { id: '1', name: 'Switch', type: 'n8n-nodes-base.switch', typeVersion: 3.2, position: [0, 0],
+            parameters: { mode: 'expression', numberOutputs: 4, output: 3, rules: { values: [{}] } } },
+          { id: '2', name: 'Next', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} },
+        ],
+        connections: { 'Switch': { main: [[], [], [], [{ node: 'Next', type: 'main', index: 0 }]] } },
+      } as any);
+      expect(result.errors.some(e => e.message.includes('exceeds its output count'))).toBe(false);
+    });
+
+    it('places a 2-rule Switch error output at main[2], or main[3] with fallbackOutput extra', async () => {
+      const switchNode = (options?: Record<string, any>) => ({
+        id: '1', name: 'Switch', type: 'n8n-nodes-base.switch', typeVersion: 3.2, position: [0, 0],
+        onError: 'continueErrorOutput',
+        parameters: { rules: { values: [{ outputKey: 'a' }, { outputKey: 'b' }] }, ...(options ? { options } : {}) },
+      });
+
+      const withoutFallback = await validator.validateWorkflow({
+        nodes: [switchNode(), { id: '2', name: 'Next', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} }],
+        connections: { 'Switch': { main: [[{ node: 'Next', type: 'main', index: 0 }], [], []] } },
+      } as any);
+      expect(withoutFallback.warnings.some(w =>
+        w.nodeName === 'Switch' && w.message.includes('main[2]')
+      )).toBe(true);
+
+      const withFallbackExtra = await validator.validateWorkflow({
+        nodes: [switchNode({ fallbackOutput: 'extra' }), { id: '2', name: 'Next', type: 'n8n-nodes-base.set', position: [200, 0], parameters: {} }],
+        connections: { 'Switch': { main: [[{ node: 'Next', type: 'main', index: 0 }], [], [], []] } },
+      } as any);
+      expect(withFallbackExtra.warnings.some(w =>
+        w.nodeName === 'Switch' && w.message.includes('main[3]')
+      )).toBe(true);
+    });
   });
 
   // ─── Workflow Patterns ─────────────────────────────────────────────
 
   describe('checkWorkflowPatterns', () => {
-    it('should suggest error handling for large workflows', async () => {
+    it('should suggest error handling for large workflows under advisory profiles', async () => {
       const builder = createWorkflow('Large');
       for (let i = 0; i < 5; i++) builder.addCustomNode('n8n-nodes-base.set', 3, {}, { name: `Set${i}` });
-      expect((await validator.validateWorkflow(builder.build() as any)).warnings.some(w => w.message.includes('Consider adding error handling'))).toBe(true);
+      // Advisory-only (RC-2): fires under ai-friendly/strict, not runtime
+      expect((await validator.validateWorkflow(builder.build() as any, { profile: 'ai-friendly' })).warnings.some(w => w.message.includes('Consider adding error handling'))).toBe(true);
+      expect((await validator.validateWorkflow(builder.build() as any)).warnings.some(w => w.message.includes('Consider adding error handling'))).toBe(false);
     });
 
-    it('should warn about long linear chains', async () => {
+    it('should suggest breaking up long linear chains under advisory profiles', async () => {
       const builder = createWorkflow('Linear');
       const names: string[] = [];
       for (let i = 0; i < 12; i++) { const n = `Node${i}`; builder.addCustomNode('n8n-nodes-base.set', 3, {}, { name: n }); names.push(n); }
       builder.connectSequentially(names);
-      expect((await validator.validateWorkflow(builder.build() as any)).warnings.some(w => w.message.includes('Long linear chain detected'))).toBe(true);
+      // Maintainability note: suggestion under ai-friendly/strict, silent at runtime
+      const aiFriendly = await validator.validateWorkflow(builder.build() as any, { profile: 'ai-friendly' });
+      expect(aiFriendly.warnings.some(w => w.message.includes('Long linear chain detected'))).toBe(false);
+      expect(aiFriendly.suggestions.some(s => s.includes('Long linear chain detected'))).toBe(true);
+      expect((await validator.validateWorkflow(builder.build() as any)).suggestions.some(s => s.includes('Long linear chain detected'))).toBe(false);
     });
 
-    it('should warn about AI agents without tools', async () => {
+    it('should suggest (not warn) about AI agents without tools', async () => {
       const result = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'Agent', type: '@n8n/n8n-nodes-langchain.agent', position: [100, 100], parameters: {} }], connections: {} } as any);
-      expect(result.warnings.some(w => w.message.includes('AI Agent has no tools connected'))).toBe(true);
+      // Single advisory from ai-node-validator, routed to suggestions
+      expect(result.warnings.some(w => w.message.includes('has no tools connected') || w.message.includes('no ai_tool connections'))).toBe(false);
+      expect(result.suggestions.some(s => s.includes('no ai_tool connections') && s.includes('Agent'))).toBe(true);
     });
 
-    it('should NOT warn about AI agents WITH tools', async () => {
+    it('should NOT advise about AI agents WITH tools', async () => {
       const result = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'Tool', type: 'n8n-nodes-base.httpRequest', position: [100, 100], parameters: {} }, { id: '2', name: 'Agent', type: '@n8n/n8n-nodes-langchain.agent', position: [300, 100], parameters: {} }], connections: { 'Tool': { ai_tool: [[{ node: 'Agent', type: 'ai_tool', index: 0 }]] } } } as any);
-      expect(result.warnings.some(w => w.message.includes('AI Agent has no tools connected'))).toBe(false);
+      expect(result.warnings.some(w => w.message.includes('has no tools connected') || w.message.includes('no ai_tool connections'))).toBe(false);
+      expect(result.suggestions.some(s => s.includes('no ai_tool connections'))).toBe(false);
     });
   });
 
@@ -725,7 +1131,9 @@ describe('WorkflowValidator', () => {
     it('should infer googleDriveTool when googleDrive exists', async () => {
       const result = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'GDT', type: 'n8n-nodes-base.googleDriveTool', typeVersion: 3, position: [250, 300], parameters: {} }], connections: {} } as any);
       expect(result.errors.filter(e => e.message?.includes('Unknown node type'))).toHaveLength(0);
-      expect(result.warnings.filter(e => (e as any).code === 'INFERRED_TOOL_VARIANT')).toHaveLength(1);
+      // Informational note rides the suggestions channel, not warnings
+      expect(result.warnings.filter(e => (e as any).code === 'INFERRED_TOOL_VARIANT')).toHaveLength(0);
+      expect(result.suggestions.filter(s => s.includes('dynamic AI Tool variant'))).toHaveLength(1);
     });
 
     it('should error for unknownNodeTool when base does not exist', async () => {
@@ -736,7 +1144,141 @@ describe('WorkflowValidator', () => {
     it('should prefer database record over inference for supabaseTool', async () => {
       const result = await validator.validateWorkflow({ nodes: [{ id: '1', name: 'ST', type: 'n8n-nodes-base.supabaseTool', typeVersion: 1, position: [250, 300], parameters: {} }], connections: {} } as any);
       expect(result.errors.filter(e => e.message?.includes('Unknown node type'))).toHaveLength(0);
-      expect(result.warnings.filter(e => (e as any).code === 'INFERRED_TOOL_VARIANT')).toHaveLength(0);
+      expect(result.suggestions.filter(s => s.includes('dynamic AI Tool variant'))).toHaveLength(0);
+    });
+  });
+
+  // ─── Conditional ai_tool Outputs (vector stores, #953/#955) ────────
+
+  describe('Conditional ai_tool outputs', () => {
+    // Mirrors the outputs expression n8n's vector-store nodes ship: the
+    // ai_tool output exists only when mode is 'retrieve-as-tool'.
+    const VECTOR_STORE_OUTPUTS_EXPRESSION = `={{
+      ((parameters) => {
+        const mode = parameters?.mode ?? 'retrieve';
+        if (mode === 'retrieve-as-tool') {
+          return [{ displayName: "Tool", type: "ai_tool"}]
+        }
+        if (mode === 'retrieve') {
+          return [{ displayName: "Vector Store", type: "ai_vectorStore"}]
+        }
+        return [{ displayName: "", type: "main"}]
+      })($parameter)
+    }}`;
+
+    beforeEach(() => {
+      // getAllNodes serves NodeSimilarityService's suggestions for the
+      // unknown-node test - the validator's repository surface, satisfied
+      // explicitly rather than via a caught TypeError.
+      const conditionalRepo = { getAllNodes: vi.fn(() => []), getNode: vi.fn((t: string) => {
+        const m: Record<string, any> = {
+          'nodes-langchain.vectorStorePinecone': { nodeType: 'nodes-langchain.vectorStorePinecone', displayName: 'Pinecone Vector Store', package: '@n8n/n8n-nodes-langchain', isAITool: false, isCommunity: false, outputs: [VECTOR_STORE_OUTPUTS_EXPRESSION], properties: [] },
+          'nodes-langchain.vectorStoreToolFirst': { nodeType: 'nodes-langchain.vectorStoreToolFirst', displayName: 'Tool-First Vector Store', package: '@n8n/n8n-nodes-langchain', isAITool: false, isCommunity: false, outputs: [VECTOR_STORE_OUTPUTS_EXPRESSION.replace("?? 'retrieve'", "?? 'retrieve-as-tool'")], properties: [] },
+          'nodes-langchain.agent': { nodeType: 'nodes-langchain.agent', displayName: 'AI Agent', package: '@n8n/n8n-nodes-langchain', isAITool: false, isCommunity: false, properties: [] },
+          'n8n-nodes-scraper.scrape': { nodeType: 'n8n-nodes-scraper.scrape', displayName: 'Scraper', package: 'n8n-nodes-scraper', isAITool: true, isCommunity: true, outputs: ['main'], properties: [] },
+        };
+        return m[t] || null;
+      }) } as any;
+      validator = new WorkflowValidator(conditionalRepo, mockEnhancedConfigValidator);
+    });
+
+    const vectorStoreWorkflow = (parameters: Record<string, any>) => ({
+      nodes: [
+        { id: '1', name: 'Pinecone', type: '@n8n/n8n-nodes-langchain.vectorStorePinecone', typeVersion: 1.3, position: [0, 0], parameters },
+        { id: '2', name: 'Agent', type: '@n8n/n8n-nodes-langchain.agent', typeVersion: 2, position: [200, 0], parameters: {} },
+      ],
+      connections: { Pinecone: { ai_tool: [[{ node: 'Agent', type: 'ai_tool', index: 0 }]] } },
+    });
+
+    it('accepts a vector store in retrieve-as-tool mode as an ai_tool source (#953)', async () => {
+      const result = await validator.validateWorkflow(vectorStoreWorkflow({ mode: 'retrieve-as-tool' }) as any);
+      expect(result.errors.filter(e => e.code === 'INVALID_AI_TOOL_SOURCE')).toHaveLength(0);
+      expect(result.errors.filter(e => e.code === 'WRONG_NODE_TYPE_FOR_AI_TOOL')).toHaveLength(0);
+      expect(result.warnings.filter(w => (w as any).code === 'AI_TOOL_MODE_MISMATCH')).toHaveLength(0);
+    });
+
+    it('does not warn about first-party langchain nodes as community tools (#955)', async () => {
+      const result = await validator.validateWorkflow(vectorStoreWorkflow({ mode: 'retrieve-as-tool' }) as any);
+      expect(result.warnings.filter(w => w.message.includes('N8N_COMMUNITY_PACKAGES_ALLOW_TOOL_USAGE'))).toHaveLength(0);
+    });
+
+    it('warns when the mode does not expose the ai_tool output', async () => {
+      const result = await validator.validateWorkflow(vectorStoreWorkflow({ mode: 'retrieve' }) as any);
+      expect(result.errors.filter(e => e.code === 'INVALID_AI_TOOL_SOURCE')).toHaveLength(0);
+      const mismatches = result.warnings.filter(w => (w as any).code === 'AI_TOOL_MODE_MISMATCH');
+      expect(mismatches).toHaveLength(1);
+      expect(mismatches[0].message).toContain('retrieve-as-tool');
+    });
+
+    it('warns when mode is unset (default mode has no ai_tool output)', async () => {
+      const result = await validator.validateWorkflow(vectorStoreWorkflow({}) as any);
+      const mismatches = result.warnings.filter(w => (w as any).code === 'AI_TOOL_MODE_MISMATCH');
+      expect(mismatches).toHaveLength(1);
+      expect(mismatches[0].message).toContain('mode is not set');
+    });
+
+    it('skips the mode check when mode is an expression', async () => {
+      const result = await validator.validateWorkflow(vectorStoreWorkflow({ mode: '={{ $json.mode }}' }) as any);
+      expect(result.errors.filter(e => e.code === 'INVALID_AI_TOOL_SOURCE')).toHaveLength(0);
+      expect(result.warnings.filter(w => (w as any).code === 'AI_TOOL_MODE_MISMATCH')).toHaveLength(0);
+    });
+
+    it('reports an empty-string mode as set, not as missing', async () => {
+      const result = await validator.validateWorkflow(vectorStoreWorkflow({ mode: '' }) as any);
+      const mismatches = result.warnings.filter(w => (w as any).code === 'AI_TOOL_MODE_MISMATCH');
+      expect(mismatches).toHaveLength(1);
+      expect(mismatches[0].message).toContain('current mode: ""');
+      expect(mismatches[0].message).not.toContain('mode is not set');
+    });
+
+    it('treats mode: null as unset and warns', async () => {
+      const result = await validator.validateWorkflow(vectorStoreWorkflow({ mode: null as any }) as any);
+      const mismatches = result.warnings.filter(w => (w as any).code === 'AI_TOOL_MODE_MISMATCH');
+      expect(mismatches).toHaveLength(1);
+      expect(mismatches[0].message).toContain('mode is not set');
+    });
+
+    it('does not warn on unset mode when the expression defaults to retrieve-as-tool', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: [
+          { id: '1', name: 'ToolFirst', type: '@n8n/n8n-nodes-langchain.vectorStoreToolFirst', typeVersion: 1, position: [0, 0], parameters: {} },
+          { id: '2', name: 'Agent', type: '@n8n/n8n-nodes-langchain.agent', typeVersion: 2, position: [200, 0], parameters: {} },
+        ],
+        connections: { ToolFirst: { ai_tool: [[{ node: 'Agent', type: 'ai_tool', index: 0 }]] } },
+      } as any);
+      expect(result.errors.filter(e => e.code === 'INVALID_AI_TOOL_SOURCE')).toHaveLength(0);
+      expect(result.warnings.filter(w => (w as any).code === 'AI_TOOL_MODE_MISMATCH')).toHaveLength(0);
+    });
+
+    it('warns about the community tool node itself, not the agent receiving it (#955)', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: [
+          { id: '1', name: 'Scraper', type: 'n8n-nodes-scraper.scrape', typeVersion: 1, position: [0, 0], parameters: {} },
+          { id: '2', name: 'Agent', type: '@n8n/n8n-nodes-langchain.agent', typeVersion: 2, position: [200, 0], parameters: {} },
+        ],
+        connections: { Scraper: { ai_tool: [[{ node: 'Agent', type: 'ai_tool', index: 0 }]] } },
+      } as any);
+      const notices = result.warnings.filter(w => w.message.includes('N8N_COMMUNITY_PACKAGES_ALLOW_TOOL_USAGE'));
+      expect(notices).toHaveLength(1);
+      expect(notices[0].nodeName).toBe('Scraper');
+      // A community node that declares usableAsTool is a valid source - the
+      // notice must not come with a validity error.
+      expect(result.errors.filter(e => e.code === 'INVALID_AI_TOOL_SOURCE')).toHaveLength(0);
+    });
+
+    it('keeps the env-var notice for a community tool the database does not know', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: [
+          { id: '1', name: 'Acme Tool', type: 'n8n-nodes-acme.acmeTool', typeVersion: 1, position: [0, 0], parameters: {} },
+          { id: '2', name: 'Agent', type: '@n8n/n8n-nodes-langchain.agent', typeVersion: 2, position: [200, 0], parameters: {} },
+        ],
+        connections: { 'Acme Tool': { ai_tool: [[{ node: 'Agent', type: 'ai_tool', index: 0 }]] } },
+      } as any);
+      const notices = result.warnings.filter(w => w.message.includes('N8N_COMMUNITY_PACKAGES_ALLOW_TOOL_USAGE'));
+      expect(notices).toHaveLength(1);
+      expect(notices[0].nodeName).toBe('Acme Tool');
+      // Unknown nodes are reported by other validation, not as invalid sources
+      expect(result.errors.filter(e => e.code === 'INVALID_AI_TOOL_SOURCE')).toHaveLength(0);
     });
   });
 
@@ -814,6 +1356,87 @@ describe('WorkflowValidator', () => {
     });
   });
 
+  describe('Canvas groups (nodeGroups)', () => {
+    // Group problems are reported as warnings, never errors: a frame is presentation, and the
+    // write path repairs or ungroups whatever n8n refuses rather than blocking the workflow.
+    const twoNodes = [
+      { id: 'a', name: 'Set A', type: 'n8n-nodes-base.set', position: [0, 0], parameters: {}, typeVersion: 3 },
+      { id: 'b', name: 'Set B', type: 'n8n-nodes-base.set', position: [100, 0], parameters: {}, typeVersion: 3 },
+    ];
+    const chain = { 'Set A': { main: [[{ node: 'Set B', type: 'main', index: 0 }]] } };
+
+    it('warns about a member that is not in the workflow, without invalidating it', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: twoNodes,
+        connections: chain,
+        nodeGroups: [{ id: 'g1', name: 'Transform', nodeIds: ['a', 'b', 'ghost'] }],
+      } as any);
+
+      const groupWarnings = result.warnings.filter(w => w.code === 'group-member-removed');
+      expect(groupWarnings).toHaveLength(1);
+      expect(groupWarnings[0].message).toContain('ghost');
+      expect(result.errors.filter(e => e.code?.startsWith('group-'))).toEqual([]);
+    });
+
+    it('warns when a node is claimed by two groups', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: twoNodes,
+        connections: chain,
+        nodeGroups: [
+          { id: 'g1', name: 'First', nodeIds: ['a'] },
+          { id: 'g2', name: 'Second', nodeIds: ['a', 'b'] },
+        ],
+      } as any);
+
+      expect(result.warnings.some(w => w.code === 'group-node-in-multiple-groups')).toBe(true);
+    });
+
+    it('warns about a trigger inside a group using node-type metadata', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: [
+          { id: 't', name: 'Webhook', type: 'n8n-nodes-base.webhook', position: [0, 0], parameters: {}, typeVersion: 2 },
+          twoNodes[0],
+        ],
+        connections: { Webhook: { main: [[{ node: 'Set A', type: 'main', index: 0 }]] } },
+        nodeGroups: [{ id: 'g1', name: 'Everything', nodeIds: ['t', 'a'] }],
+      } as any);
+
+      expect(result.warnings.some(w => w.code === 'group-contains-trigger')).toBe(true);
+    });
+
+    it('handles a group member listed many times', async () => {
+      vi.mocked(mockNodeRepository.getNode).mockClear();
+      const result = await validator.validateWorkflow({
+        nodes: [
+          { id: 't', name: 'Webhook', type: 'n8n-nodes-base.webhook', position: [0, 0], parameters: {}, typeVersion: 2 },
+          twoNodes[0],
+        ],
+        connections: { Webhook: { main: [[{ node: 'Set A', type: 'main', index: 0 }]] } },
+        nodeGroups: [{ id: 'g1', name: 'Everything', nodeIds: Array.from({ length: 2_000 }, () => 't') }],
+      } as any);
+
+      expect(vi.mocked(mockNodeRepository.getNode).mock.calls.length).toBeLessThan(50);
+      expect(result.warnings.filter(w => w.code === 'group-contains-trigger')).toHaveLength(1);
+      expect(result.warnings.filter(w => w.code === 'group-node-in-multiple-groups')).toHaveLength(1);
+    });
+
+    it('says nothing about a healthy grouping', async () => {
+      const result = await validator.validateWorkflow({
+        nodes: twoNodes,
+        connections: chain,
+        nodeGroups: [{ id: 'g1', name: 'Transform', nodeIds: ['a', 'b'] }],
+      } as any);
+
+      expect(result.warnings.filter(w => w.code?.startsWith('group-'))).toEqual([]);
+    });
+
+    it('says nothing when the workflow has no groups', async () => {
+      const result = await validator.validateWorkflow({ nodes: twoNodes, connections: chain } as any);
+
+      expect(result.warnings.filter(w => w.code?.startsWith('group-'))).toEqual([]);
+    });
+  });
+
   // ─── Integration Tests ─────────────────────────────────────────────
 
   describe('Integration Tests', () => {
@@ -839,7 +1462,7 @@ describe('WorkflowValidator', () => {
   // ─── If/Switch conditions validation ──────────────────────────────
 
   describe('If/Switch conditions validation (validateConditionNodeStructure)', () => {
-    it('If v2.3 missing conditions.options → error', () => {
+    it('If v2.3 missing conditions.options → no error (options are optional with defaults)', () => {
       const node = {
         id: '1', name: 'IF', type: 'n8n-nodes-base.if', typeVersion: 2.3,
         position: [0, 0] as [number, number],
@@ -851,8 +1474,7 @@ describe('WorkflowValidator', () => {
         }
       };
       const errors = validateConditionNodeStructure(node);
-      expect(errors.length).toBeGreaterThan(0);
-      expect(errors.some(e => e.includes('options'))).toBe(true);
+      expect(errors).toHaveLength(0);
     });
 
     it('If v2.3 with complete options → no error', () => {
@@ -914,7 +1536,7 @@ describe('WorkflowValidator', () => {
       expect(errors).toHaveLength(0);
     });
 
-    it('Switch v3.2 missing rule options → error', () => {
+    it('Switch v3.2 missing rule options → no error (options are optional with defaults)', () => {
       const node = {
         id: '1', name: 'Switch', type: 'n8n-nodes-base.switch', typeVersion: 3.2,
         position: [0, 0] as [number, number],
@@ -931,8 +1553,7 @@ describe('WorkflowValidator', () => {
         }
       };
       const errors = validateConditionNodeStructure(node);
-      expect(errors.length).toBeGreaterThan(0);
-      expect(errors.some(e => e.includes('rules.rules[0].conditions.options'))).toBe(true);
+      expect(errors).toHaveLength(0);
     });
 
     it('Switch v3.2 with complete options → no error', () => {
@@ -985,6 +1606,142 @@ describe('WorkflowValidator', () => {
       };
       const errors = validateConditionNodeStructure(node);
       expect(errors).toHaveLength(0);
+    });
+
+    it.each([
+      { label: 'a null rule', rule: null },
+      { label: 'a string rule', rule: 'Branch 1' },
+      { label: 'a numeric rule', rule: 0 },
+      // typeof [] === 'object', so an array slipped through a plain typeof check.
+      { label: 'an array rule', rule: [] },
+    ])('Switch v3.2 with $label → reports the entry instead of dereferencing it (#1094)', ({ rule }) => {
+      const node = {
+        id: '1', name: 'Switch', type: 'n8n-nodes-base.switch', typeVersion: 3.2,
+        position: [0, 0] as [number, number],
+        parameters: { rules: { rules: [rule] } }
+      };
+      expect(validateConditionNodeStructure(node as any))
+        .toEqual(['rules.rules[0]: rule is missing or not an object']);
+    });
+
+    it.each([
+      { label: 'a string', rules: 'abc' },
+      { label: 'an object with a length', rules: { length: 2 } },
+    ])('Switch v3.2 with $label as the rules collection → reports it rather than reading zero rules (#1094)', ({ rules }) => {
+      const node = {
+        id: '1', name: 'Switch', type: 'n8n-nodes-base.switch', typeVersion: 3.2,
+        position: [0, 0] as [number, number],
+        parameters: { rules: { rules } }
+      };
+      expect(validateConditionNodeStructure(node as any))
+        .toEqual(['rules.rules: rules is not an array']);
+    });
+
+    it('Switch v3.2 with well-formed rules under "values" validates clean', () => {
+      const node = {
+        id: '1', name: 'Switch', type: 'n8n-nodes-base.switch', typeVersion: 3.2,
+        position: [0, 0] as [number, number],
+        parameters: { rules: { values: [{ conditions: { conditions: [] } }] } }
+      };
+      expect(validateConditionNodeStructure(node as any)).toEqual([]);
+    });
+
+    // `values` is the key n8n reads at 3.2+ and the one 319 of the 448 Switch nodes in the
+    // bundled templates use, so before #1097 none of the checks below ran on a real Switch.
+    it('Switch v3.2 operator under "values" missing its type is reported (#1097)', () => {
+      const node = {
+        id: '1', name: 'Switch', type: 'n8n-nodes-base.switch', typeVersion: 3.2,
+        position: [0, 0] as [number, number],
+        parameters: {
+          rules: {
+            values: [{
+              conditions: {
+                conditions: [{ leftValue: '={{ $json.x }}', rightValue: 'a', operator: { operation: 'equals' } }],
+                combinator: 'and'
+              },
+              outputKey: 'Branch 1'
+            }]
+          }
+        }
+      };
+      const errors = validateConditionNodeStructure(node as any);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('rules.values[0].conditions.conditions[0].operator');
+      expect(errors[0]).toContain('missing required field "type"');
+    });
+
+    it('Switch v3.2 operator under "values" naming an operation in the type field is reported (#1097)', () => {
+      const node = {
+        id: '1', name: 'Switch', type: 'n8n-nodes-base.switch', typeVersion: 3.2,
+        position: [0, 0] as [number, number],
+        parameters: {
+          rules: {
+            values: [{
+              conditions: {
+                conditions: [{ leftValue: '={{ $json.x }}', operator: { type: 'equals', operation: 'equals' } }],
+                combinator: 'and'
+              }
+            }]
+          }
+        }
+      };
+      const errors = validateConditionNodeStructure(node as any);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('rules.values[0].conditions.conditions[0].operator');
+      expect(errors[0]).toContain('invalid type "equals"');
+    });
+
+    it.each([
+      { label: 'a null rule', rule: null },
+      { label: 'a string rule', rule: 'Branch 1' },
+      { label: 'an array rule', rule: [] },
+    ])('Switch v3.2 with $label under "values" reports the entry instead of accepting it (#1097)', ({ rule }) => {
+      const node = {
+        id: '1', name: 'Switch', type: 'n8n-nodes-base.switch', typeVersion: 3.2,
+        position: [0, 0] as [number, number],
+        parameters: { rules: { values: [rule] } }
+      };
+      expect(validateConditionNodeStructure(node as any))
+        .toEqual(['rules.values[0]: rule is missing or not an object']);
+    });
+
+    it.each([
+      { label: 'a string', values: 'abc' },
+      { label: 'an object with a length', values: { length: 2 } },
+    ])('Switch v3.2 with $label as the "values" collection is reported (#1097)', ({ values }) => {
+      const node = {
+        id: '1', name: 'Switch', type: 'n8n-nodes-base.switch', typeVersion: 3.2,
+        position: [0, 0] as [number, number],
+        parameters: { rules: { values } }
+      };
+      expect(validateConditionNodeStructure(node as any))
+        .toEqual(['rules.values: rules is not an array']);
+    });
+
+    // The 5 templates in the bundled corpus that store rules under `rules` are all typeVersion 1,
+    // where that key and its {value2, operation} entries are the correct legacy shape. The 3.2
+    // gate is what keeps them out, so nothing here may start reporting them.
+    it('Switch v1 legacy rules.rules entries are not validated against the v3.2 structure', () => {
+      const node = {
+        id: '1', name: 'Switch', type: 'n8n-nodes-base.switch', typeVersion: 1,
+        position: [0, 0] as [number, number],
+        parameters: {
+          dataType: 'string',
+          value1: '={{ $json.category }}',
+          rules: { rules: [{ value2: 'booking' }, { output: 1, value2: 'pricing' }] }
+        }
+      };
+      expect(validateConditionNodeStructure(node as any)).toEqual([]);
+    });
+
+    it('If v2.2 with a null condition entry → reports the missing operator (#1094)', () => {
+      const node = {
+        id: '1', name: 'IF', type: 'n8n-nodes-base.if', typeVersion: 2.2,
+        position: [0, 0] as [number, number],
+        parameters: { conditions: { conditions: [null] } }
+      };
+      expect(validateConditionNodeStructure(node as any))
+        .toEqual(['conditions.conditions[0].operator: operator is missing or not an object']);
     });
   });
 });

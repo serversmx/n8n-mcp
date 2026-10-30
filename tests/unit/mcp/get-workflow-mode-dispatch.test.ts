@@ -9,6 +9,7 @@ const handlerMocks = vi.hoisted(() => ({
   handleGetWorkflowStructure: vi.fn().mockResolvedValue({ success: true, data: { mode: 'structure' } }),
   handleGetWorkflowMinimal: vi.fn().mockResolvedValue({ success: true, data: { mode: 'minimal' } }),
   handleGetWorkflowActive: vi.fn().mockResolvedValue({ success: true, data: { mode: 'active' } }),
+  handleGetWorkflowFiltered: vi.fn().mockResolvedValue({ success: true, data: { mode: 'filtered' } }),
 }));
 
 vi.mock('../../../src/mcp/handlers-n8n-manager', async (importOriginal) => {
@@ -70,5 +71,26 @@ describe('n8n_get_workflow mode dispatch', () => {
 
     expect(handlerMocks.handleGetWorkflowDetails).toHaveBeenCalledTimes(1);
     expect(handlerMocks.handleGetWorkflowActive).not.toHaveBeenCalled();
+  });
+
+  it('routes mode="filtered" to handleGetWorkflowFiltered', async () => {
+    // The global afterEach (tests/setup/global-setup.ts) runs vi.restoreAllMocks(), which
+    // strips the hoisted mockResolvedValue after the first test. Re-apply it here so the
+    // returned-data assertion is order-independent.
+    handlerMocks.handleGetWorkflowFiltered.mockResolvedValue({ success: true, data: { mode: 'filtered' } });
+
+    const result = await server.testExecuteTool('n8n_get_workflow', { id: 'wf-1', mode: 'filtered', nodeNames: ['Code'] });
+
+    expect(handlerMocks.handleGetWorkflowFiltered).toHaveBeenCalledTimes(1);
+    expect(handlerMocks.handleGetWorkflow).not.toHaveBeenCalled();
+    expect(result.data.mode).toBe('filtered');
+  });
+
+  it('still routes mode="filtered" to its handler when nodeNames is absent (handler does the Zod check)', async () => {
+    // The dispatch layer only requires id; nodeNames is validated inside the handler so a
+    // missing value yields a graceful { success: false } rather than a thrown dispatch error.
+    await server.testExecuteTool('n8n_get_workflow', { id: 'wf-1', mode: 'filtered' });
+
+    expect(handlerMocks.handleGetWorkflowFiltered).toHaveBeenCalledTimes(1);
   });
 });

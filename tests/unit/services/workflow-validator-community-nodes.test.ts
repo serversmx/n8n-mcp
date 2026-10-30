@@ -66,10 +66,10 @@ describe('WorkflowValidator - Community Node Handling', () => {
     const result = await validator.validateWorkflow(workflow as any);
 
     const communityWarning = result.warnings.find(
-      (w: any) => w.code === 'COMMUNITY_NODE_NOT_IN_CATALOG'
+      (w: any) => w.message?.includes('@renatoascencio/n8n-nodes-chatwoot.chatwoot')
     );
     expect(communityWarning).toBeDefined();
-    expect(communityWarning!.message).toContain('@renatoascencio/n8n-nodes-chatwoot.chatwoot');
+    expect(communityWarning!.message).toContain('community node');
 
     // The community node should NOT produce an error
     const chatwootError = result.errors.find(

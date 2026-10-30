@@ -9,6 +9,43 @@ Versioning: `v<upstream-version>-chatwoot.<n>` where:
 - `<upstream-version>` is the n8n-mcp version we synced from (e.g., `2.51.1`)
 - `<n>` is the iteration number for fork-specific changes on that base
 
+## [Unreleased] - Sync with upstream v2.99.2 (n8n 2.44.x)
+
+### Changed
+
+- **Merged `czlonkowski/n8n-mcp` v2.99.2** (was 2.53.0). n8n-nodes-base, n8n-core and
+  @n8n/n8n-nodes-langchain 2.44.3, n8n-workflow 2.44.2, MCP SDK 1.30.0. Brings the upstream security fixes
+  (SSRF hostname normalization, multi-tenant session isolation, validation DoS limits, telemetry/log
+  redaction, prototype pollution) and node validation for n8n up to 2.44 (deprecated-node warnings, current
+  typeVersions). Node 20 is no longer supported: use Node `^22.23.4 || ^24.22.1 || >=26.12.1`.
+- **`data/nodes.db` is upstream's 2.44.x database plus the registered fork nodes**: the three
+  `@renatoascencio/n8n-nodes-chatwoot` 0.9.0 nodes and the three `@renatoascencio/n8n-nodes-evolution-api` 0.1.0
+  nodes (3,149 nodes in total).
+- **Fork tools moved to upstream's `additionalTools` seam** (`src/mcp/fork-additional-tools.ts`):
+  `chatwoot_doctor`, `n8n_login`, `n8n_create_folder` and `n8n_move_workflow` no longer patch the tool lists
+  and dispatch switch in `server.ts`, which removes the recurring merge conflicts there. A host that passes
+  its own `additionalTools` keeps full control of the tool surface. REST tools stay off in multi-tenant mode.
+- Dropped fork-only edits that upstream now covers: visible-defaults handling in the config validator and
+  the unknown community node warning (`COMMUNITY_NODE_NOT_IN_CATALOG` is now upstream's plain warning).
+  Kept: `multiOptions` membership validation (Chatwoot Trigger events) and Chatwoot registration in `rebuild`.
+- CI: removed the fork-deleted `docker-build*.yml` again and restored upstream's generated
+  `issue-triage.lock.yml` (the self-hosted runner edit would queue jobs on a public repo).
+
+### Added
+
+- **`npm run register:community -- --package <built package root>`**
+  (`src/scripts/register-community-package.ts`): registers any built community package (nodes, Tool variants,
+  triggers) in an existing `data/nodes.db`, replacing its previous rows and keeping fetched README data.
+  Used for `@renatoascencio/n8n-nodes-evolution-api`, so `search_nodes`, `get_node` and `validate_workflow`
+  know the node.
+
+### Compatibility checked
+
+- n8n 2.45.7 (current stable): the internal REST endpoints the fork uses (`POST /rest/login` with
+  `emailOrLdapLoginId` and `mfaCode`, `POST /rest/projects/:id/folders`, `PATCH /rest/workflows/:id` with only
+  `parentFolderId`) are unchanged, and the public API differs from 2.44.5 only by additions (the schemas are
+  identical). Upstream's own contract check stops at 2.44.5.
+
 ## [Unreleased] - Chatwoot node 0.9.0
 
 ### Changed
@@ -96,9 +133,12 @@ Initial Chatwoot integration baseline. See git history for details.
 
 ## How to update
 
-1. Sync with upstream: `git fetch upstream && git merge upstream/main`
-2. Resolve conflicts (preserve fork-specific files)
-3. Re-register Chatwoot nodes if `data/nodes.db` was overwritten (`npm run build && npm run register:chatwoot`)
-4. Run `npm run build` and chatwoot tests
-5. Tag as `v<new-upstream>-chatwoot.<next-n>`
-6. Add entry to this file
+1. Work in a separate worktree: `git worktree add <dir> -b <branch> origin/main`
+2. Sync with upstream: `git fetch upstream && git merge upstream/main`
+3. Resolve conflicts (preserve fork-specific files). Take upstream's `data/nodes.db`, workflows and generated
+   files; keep `docker-build*.yml` and `CLAUDE.md` deleted
+4. Inside a `node:22.23.4` container: `npm ci --legacy-peer-deps && npm run build`, then re-register the fork
+   nodes in the database: `npm run register:chatwoot` and
+   `npm run register:community -- --package <built @renatoascencio/n8n-nodes-evolution-api>`
+5. Run `tsc`, the unit tests and a stdio smoke test (`tools/list` shows `chatwoot_doctor`, `n8n_login`...)
+6. Add entry to this file; merge through a PR; the GHCR image rebuilds

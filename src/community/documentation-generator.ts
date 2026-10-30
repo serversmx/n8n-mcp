@@ -32,6 +32,11 @@ export interface DocumentationInput {
   description?: string;
   readme: string;
   npmPackageName?: string;
+  /**
+   * Names of every node the package ships. Set when the summary will be stored
+   * on all of them, so the prompt describes the package rather than one node.
+   */
+  nodeNames?: string[];
 }
 
 /**
@@ -59,6 +64,12 @@ export interface DocumentationGeneratorConfig {
   maxTokens?: number;
   /** Temperature for generation (default: 0.3, set to undefined to omit) */
   temperature?: number;
+  /**
+   * Send the vLLM-only `chat_template_kwargs: { enable_thinking: false }` body
+   * field (default: true). Must be false for OpenAI-compatible cloud APIs
+   * (OpenAI, Azure OpenAI) which reject unknown parameters with HTTP 400.
+   */
+  sendThinkingKwargs?: boolean;
 }
 
 /**
@@ -69,6 +80,7 @@ const DEFAULT_CONFIG: Required<Omit<DocumentationGeneratorConfig, 'baseUrl' | 't
   apiKey: 'not-needed',
   timeout: 60000,
   maxTokens: 2000,
+  sendThinkingKwargs: true,
 };
 
 /**
@@ -83,6 +95,7 @@ export class DocumentationGenerator {
   private maxTokens: number;
   private timeout: number;
   private temperature?: number;
+  private sendThinkingKwargs: boolean;
 
   constructor(config: DocumentationGeneratorConfig) {
     const fullConfig = { ...DEFAULT_CONFIG, ...config };
@@ -98,6 +111,7 @@ export class DocumentationGenerator {
     this.maxTokens = fullConfig.maxTokens;
     this.timeout = fullConfig.timeout;
     this.temperature = fullConfig.temperature;
+    this.sendThinkingKwargs = fullConfig.sendThinkingKwargs;
   }
 
   /**
@@ -193,6 +207,23 @@ export class DocumentationGenerator {
   private buildPrompt(input: DocumentationInput): string {
     // Truncate README to avoid token limits (keep first ~6000 chars)
     const truncatedReadme = this.truncateReadme(input.readme, 6000);
+
+    // A package-scoped summary is stored on every node the package ships, so
+    // naming one of them would attribute the text to the wrong node.
+    if (input.nodeNames?.length) {
+      return `
+Package Information:
+- Package: ${input.npmPackageName || 'unknown'}
+- Nodes: ${input.nodeNames.join(', ')}
+- Description: ${input.description || 'No description provided'}
+
+README Content:
+${truncatedReadme}
+
+Based on the README and package information above, generate a structured documentation summary
+covering the package as a whole, including every node listed above.
+`.trim();
+    }
 
     return `
 Node Information:
@@ -356,7 +387,9 @@ Guidelines:
           messages,
           max_completion_tokens: maxTokens,
           ...(this.temperature !== undefined ? { temperature: this.temperature } : {}),
-          chat_template_kwargs: { enable_thinking: false },
+          // vLLM thinking models accept this to disable reasoning output; cloud
+          // OpenAI-compatible APIs (OpenAI, Azure) reject unknown params (HTTP 400).
+          ...(this.sendThinkingKwargs ? { chat_template_kwargs: { enable_thinking: false } } : {}),
         }),
         signal: controller.signal,
       });
@@ -395,6 +428,7 @@ export function createDocumentationGenerator(): DocumentationGenerator {
     const host = new URL(baseUrl).hostname;
     const isCloud =
       host === 'openai.com' || host.endsWith('.openai.com') ||
+      host.endsWith('.openai.azure.com') || host.endsWith('.azure.com') ||
       host === 'anthropic.com' || host.endsWith('.anthropic.com');
     isLocalServer = !isCloud;
   } catch {
@@ -407,5 +441,7 @@ export function createDocumentationGenerator(): DocumentationGenerator {
     timeout,
     ...(apiKey ? { apiKey } : {}),
     ...(isLocalServer ? { temperature: 0.3 } : {}),
+    // Only vLLM/local servers understand chat_template_kwargs; cloud APIs reject it.
+    sendThinkingKwargs: isLocalServer,
   });
 }

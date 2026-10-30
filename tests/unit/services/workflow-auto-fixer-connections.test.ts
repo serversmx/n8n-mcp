@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { WorkflowAutoFixer } from '@/services/workflow-auto-fixer';
+import { MAX_CONNECTION_INDEX } from '@/services/workflow-diff-engine';
 import { NodeRepository } from '@/database/node-repository';
 import type { WorkflowValidationResult } from '@/services/workflow-validator';
 import type { Workflow, WorkflowNode } from '@/types/n8n-api';
@@ -97,6 +98,32 @@ describe('WorkflowAutoFixer - Connection Fixes', () => {
       expect(connFixes).toHaveLength(2);
     });
 
+    // A null branch is n8n's own "nothing wired to this output" and survives into a fetched
+    // workflow (#1096); spreading it threw "nodeConn.main[index] is not iterable" out of
+    // n8n_autofix_workflow, which the handler's catch-all returned as an opaque error.
+    it('merges a numeric key into a null main branch instead of throwing', async () => {
+      const workflow = createMockWorkflow(
+        [createMockNode('id1', 'Node1'), createMockNode('id2', 'Node2'), createMockNode('id3', 'Node3')],
+        {
+          Node1: {
+            main: [[{ node: 'Node2', type: 'main', index: 0 }], null],
+            '1': [[{ node: 'Node3', type: 'main', index: 0 }]]
+          }
+        }
+      );
+
+      const result = await autoFixer.generateFixes(workflow, emptyValidation, []);
+
+      const connFixes = result.fixes.filter(f => f.type === 'connection-numeric-keys');
+      expect(connFixes).toHaveLength(1);
+      // The null slot held nothing, so this is a conversion, not a merge into existing entries.
+      expect(connFixes[0].confidence).toBe('high');
+
+      const replaceOp = result.operations.find(op => op.type === 'replaceConnections') as any;
+      expect(replaceOp.connections.Node1['main'][1]).toEqual([{ node: 'Node3', type: 'main', index: 0 }]);
+      expect(replaceOp.connections.Node1['1']).toBeUndefined();
+    });
+
     it('should merge with existing main entries', async () => {
       const workflow = createMockWorkflow(
         [createMockNode('id1', 'Node1'), createMockNode('id2', 'Node2'), createMockNode('id3', 'Node3')],
@@ -131,6 +158,41 @@ describe('WorkflowAutoFixer - Connection Fixes', () => {
       expect(replaceOp.connections.Node1['main']).toHaveLength(4);
       expect(replaceOp.connections.Node1['main'][1]).toEqual([]);
       expect(replaceOp.connections.Node1['main'][2]).toEqual([]);
+    });
+
+    it('leaves numeric keys above the connection index limit unconverted', async () => {
+      const tooLarge = String(MAX_CONNECTION_INDEX + 1);
+      const workflow = createMockWorkflow(
+        [createMockNode('id1', 'Node1'), createMockNode('id2', 'Node2'), createMockNode('id3', 'Node3')],
+        {
+          Node1: {
+            '0': [[{ node: 'Node2', type: 'main', index: 0 }]],
+            [tooLarge]: [[{ node: 'Node3', type: 'main', index: 0 }]],
+            '9000000000': [[{ node: 'Node3', type: 'main', index: 0 }]]
+          }
+        }
+      );
+
+      const result = await autoFixer.generateFixes(workflow, emptyValidation, []);
+      const connFixes = result.fixes.filter(f => f.type === 'connection-numeric-keys');
+      expect(connFixes.map(f => f.before)).toEqual(['0']);
+
+      const replaceOp = result.operations.find(op => op.type === 'replaceConnections') as any;
+      expect(replaceOp.connections.Node1['main']).toEqual([[{ node: 'Node2', type: 'main', index: 0 }]]);
+      expect(replaceOp.connections.Node1[tooLarge]).toBeDefined();
+      expect(replaceOp.connections.Node1['9000000000']).toBeDefined();
+    });
+
+    it('converts a numeric key at the connection index limit', async () => {
+      const workflow = createMockWorkflow(
+        [createMockNode('id1', 'Node1'), createMockNode('id2', 'Node2')],
+        { Node1: { [String(MAX_CONNECTION_INDEX)]: [[{ node: 'Node2', type: 'main', index: 0 }]] } }
+      );
+
+      const result = await autoFixer.generateFixes(workflow, emptyValidation, []);
+      const replaceOp = result.operations.find(op => op.type === 'replaceConnections') as any;
+      expect(replaceOp.connections.Node1['main']).toHaveLength(MAX_CONNECTION_INDEX + 1);
+      expect(replaceOp.connections.Node1['main'][MAX_CONNECTION_INDEX]).toEqual([{ node: 'Node2', type: 'main', index: 0 }]);
     });
   });
 
@@ -206,6 +268,25 @@ describe('WorkflowAutoFixer - Connection Fixes', () => {
       expect(connFixes).toHaveLength(1);
       expect(connFixes[0].before).toBe('def-456');
       expect(connFixes[0].after).toBe('Node2');
+    });
+
+    it('should keep the ID key when the node name is reserved', async () => {
+      const workflow = createMockWorkflow(
+        [createMockNode('abc-123', '__proto__'), createMockNode('def-456', 'Node2')],
+        {
+          'abc-123': {
+            main: [[{ node: 'Node2', type: 'main', index: 0 }]]
+          }
+        }
+      );
+
+      const result = await autoFixer.generateFixes(workflow, emptyValidation, []);
+      expect(result.fixes.filter(f => f.type === 'connection-id-to-name')).toHaveLength(0);
+      const replaceOp = result.operations.find(op => op.type === 'replaceConnections') as any;
+      if (replaceOp) {
+        expect(Object.getPrototypeOf(replaceOp.connections)).toBe(Object.prototype);
+        expect(replaceOp.connections['abc-123']).toBeDefined();
+      }
     });
 
     it('should NOT fix when key matches both an ID and a name', async () => {

@@ -13,6 +13,7 @@ export const n8nManageCredentialsDoc: ToolDocumentation = {
       'Credential data values are never logged for security',
       'Use with n8n_audit_instance to fix security findings',
       'Pass includeUsage:true on list/get to see which workflows reference each credential',
+      'list returns up to 100 per page (limit: 1-100, default 100) - pass the returned nextCursor back as cursor to page further; includeUsage:true scans all pages automatically (capped at 5000 credentials)',
       'Actions: list, get, create, update, delete, getSchema',
     ]
   },
@@ -63,11 +64,21 @@ export const n8nManageCredentialsDoc: ToolDocumentation = {
       includeUsage: {
         type: 'boolean',
         required: false,
-        description: 'For list/get: when true, also return the workflows that reference each credential (workflow id, name, active). Triggers a full workflow scan; slower on large instances. Default: false.',
+        description: 'For list/get: when true, also return the workflows that reference each credential (workflow id, name, active). On list, this scans all credential pages (up to 5000 credentials; ignores cursor/limit and returns no nextCursor) so the inventory is complete. Triggers a full workflow scan; slower on large instances. Default: false.',
+      },
+      cursor: {
+        type: 'string',
+        required: false,
+        description: 'For list: pagination cursor from a previous response\'s nextCursor. Use to page beyond the first 100 credentials. Ignored when includeUsage is true.',
+      },
+      limit: {
+        type: 'number',
+        required: false,
+        description: 'For list: maximum number of credentials to return per page (1-100, default 100 per the n8n API). Ignored when includeUsage is true.',
       },
     },
     returns: `Depends on action:
-- list: { credentials: [{id, name, type, createdAt, updatedAt}], count: number, nextCursor?: string }. With includeUsage=true, each credential also has usedIn (array of {id, name, active}) and usageCount (number of distinct workflows), and the response may include usageScanError if the workflow scan failed (base credentials still returned).
+- list: { credentials: [{id, name, type, createdAt, updatedAt}], count: number, nextCursor?: string }. When nextCursor is present, pass it back as cursor to fetch the next page. With includeUsage=true, the full credential set is scanned across all pages (no nextCursor returned); each credential also has usedIn (array of {id, name, active}) and usageCount (number of distinct workflows), and the response may include usageScanError if the workflow scan failed (base credentials still returned).
 - get: Credential object with id, name, type, createdAt, updatedAt. With includeUsage=true, also includes usedIn and usageCount; if the workflow scan fails, usageScanError is set on the response and usedIn/usageCount are omitted.
 - create: Created credential object with id, name, type
 - update: Updated credential object
@@ -76,8 +87,9 @@ export const n8nManageCredentialsDoc: ToolDocumentation = {
     examples: [
       '// Discover schema before creating\nn8n_manage_credentials({action: "getSchema", type: "httpHeaderAuth"})',
       '// Create an HTTP header auth credential\nn8n_manage_credentials({action: "create", name: "My API Key", type: "httpHeaderAuth", data: {name: "X-API-Key", value: "sk-abc123"}})',
-      '// List all credentials\nn8n_manage_credentials({action: "list"})',
-      '// List credentials with the workflows that use each one\nn8n_manage_credentials({action: "list", includeUsage: true})',
+      '// List credentials (first page)\nn8n_manage_credentials({action: "list"})',
+      '// Fetch the next page using the previous response\'s nextCursor\nn8n_manage_credentials({action: "list", cursor: "eyJsaW1pdCI6MTAwLCJvZmZzZXQiOjEwMH0="})',
+      '// List ALL credentials with the workflows that use each one (full scan, all pages)\nn8n_manage_credentials({action: "list", includeUsage: true})',
       '// Get a specific credential\nn8n_manage_credentials({action: "get", id: "123"})',
       '// Get a credential with the workflows that reference it\nn8n_manage_credentials({action: "get", id: "123", includeUsage: true})',
       '// Update credential data\nn8n_manage_credentials({action: "update", id: "123", data: {value: "new-secret-value"}})',

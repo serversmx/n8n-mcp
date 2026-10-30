@@ -382,7 +382,7 @@ describe('HTTP Server instance URL validation (GHSA-4ggg-h7ph-26qr)', () => {
     });
   });
 
-  describe('GHSA-jxx9-px88-pj69 — multi-tenant header omission', () => {
+  describe('GHSA-jxx9-px88-pj69, GHSA-2cf7-hpwf-47h9 — multi-tenant header omission', () => {
     beforeEach(() => {
       process.env.ENABLE_MULTI_TENANT = 'true';
       // Process-level credentials must not leak to tenants even when set.
@@ -427,6 +427,52 @@ describe('HTTP Server instance URL validation (GHSA-4ggg-h7ph-26qr)', () => {
       expect(res.status).toHaveBeenCalledWith(400);
     });
 
+    it('rejects request with only the url tenant header', async () => {
+      server = new SingleSessionHTTPServer();
+      await server.start();
+
+      const handler = findHandler('post', '/mcp');
+      const { req, res } = createMockReqRes();
+      req.headers = {
+        authorization: `Bearer ${TEST_AUTH_TOKEN}`,
+        'x-n8n-url': 'https://tenant-n8n.example.com',
+      };
+      await handler(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      const jsonArgs = (res.json as any).mock.calls[0][0];
+      expect(jsonArgs).toMatchObject({
+        jsonrpc: '2.0',
+        error: {
+          code: -32602,
+          message: 'Multi-tenant headers required',
+        },
+      });
+    });
+
+    it('rejects request with only the key tenant header', async () => {
+      server = new SingleSessionHTTPServer();
+      await server.start();
+
+      const handler = findHandler('post', '/mcp');
+      const { req, res } = createMockReqRes();
+      req.headers = {
+        authorization: `Bearer ${TEST_AUTH_TOKEN}`,
+        'x-n8n-key': 'tenant-api-key',
+      };
+      await handler(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      const jsonArgs = (res.json as any).mock.calls[0][0];
+      expect(jsonArgs).toMatchObject({
+        jsonrpc: '2.0',
+        error: {
+          code: -32602,
+          message: 'Multi-tenant headers required',
+        },
+      });
+    });
+
     it('allows request with both tenant headers in multi-tenant mode', async () => {
       server = new SingleSessionHTTPServer();
       await server.start();
@@ -442,6 +488,102 @@ describe('HTTP Server instance URL validation (GHSA-4ggg-h7ph-26qr)', () => {
 
       // Must not be a 400; the transport mock then returns 200.
       expect(res.status).not.toHaveBeenCalledWith(400);
+    });
+  });
+
+  // The MCP access token for n8n's instance-level MCP server travels in its
+  // own header, next to the URL and API key. A context carrying the URL plus
+  // either credential is authoritative for the request, so a URL + token set
+  // with no API key must still produce a context (otherwise the request would
+  // silently fall back to the operator's environment credentials). The URL is
+  // not optional: the MCP endpoint is derived from it.
+  describe('x-n8n-mcp-token header', () => {
+    it('carries the MCP access token into the instance context', async () => {
+      server = new SingleSessionHTTPServer();
+      await server.start();
+      const spy = vi.spyOn(server, 'handleRequest').mockResolvedValue(undefined as any);
+
+      const handler = findHandler('post', '/mcp');
+      const { req, res } = createMockReqRes();
+      req.headers = {
+        authorization: `Bearer ${TEST_AUTH_TOKEN}`,
+        'x-n8n-url': 'https://tenant-n8n.example.com',
+        'x-n8n-key': 'tenant-api-key',
+        'x-n8n-mcp-token': 'tenant-mcp-token',
+      };
+      await handler(req, res);
+
+      expect(res.status).not.toHaveBeenCalledWith(400);
+      expect(spy).toHaveBeenCalledWith(req, res, expect.objectContaining({
+        n8nApiUrl: 'https://tenant-n8n.example.com',
+        n8nApiKey: 'tenant-api-key',
+        n8nMcpAccessToken: 'tenant-mcp-token',
+      }));
+    });
+
+    it('builds a context from the URL and the token alone, with no API key', async () => {
+      server = new SingleSessionHTTPServer();
+      await server.start();
+      const spy = vi.spyOn(server, 'handleRequest').mockResolvedValue(undefined as any);
+
+      const handler = findHandler('post', '/mcp');
+      const { req, res } = createMockReqRes();
+      req.headers = {
+        authorization: `Bearer ${TEST_AUTH_TOKEN}`,
+        'x-n8n-url': 'https://tenant-n8n.example.com',
+        'x-n8n-mcp-token': 'tenant-mcp-token',
+      };
+      await handler(req, res);
+
+      expect(res.status).not.toHaveBeenCalledWith(400);
+      const context = spy.mock.calls[0][2] as any;
+      expect(context).toMatchObject({ n8nApiUrl: 'https://tenant-n8n.example.com', n8nMcpAccessToken: 'tenant-mcp-token' });
+      expect(context.n8nApiKey).toBeUndefined();
+    });
+
+    // A token without x-n8n-url is an incomplete header set, exactly like
+    // x-n8n-key without x-n8n-url: it cannot address the caller's instance,
+    // and letting it through would resolve to the operator's own
+    // N8N_MCP_ACCESS_TOKEN from the environment.
+    it('rejects a token header sent without x-n8n-url', async () => {
+      process.env.N8N_API_URL = 'https://operator-n8n.example.com';
+      process.env.N8N_MCP_ACCESS_TOKEN = 'operator-mcp-token';
+      server = new SingleSessionHTTPServer();
+      await server.start();
+      const spy = vi.spyOn(server, 'handleRequest').mockResolvedValue(undefined as any);
+
+      const handler = findHandler('post', '/mcp');
+      const { req, res } = createMockReqRes();
+      req.headers = {
+        authorization: `Bearer ${TEST_AUTH_TOKEN}`,
+        'x-n8n-mcp-token': 'tenant-mcp-token',
+      };
+      await handler(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect((res.json as any).mock.calls[0][0]).toMatchObject({
+        jsonrpc: '2.0',
+        error: { code: -32602, message: 'x-n8n-mcp-token requires x-n8n-url' },
+      });
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it('rejects a malformed token before the request is dispatched', async () => {
+      server = new SingleSessionHTTPServer();
+      await server.start();
+      const spy = vi.spyOn(server, 'handleRequest').mockResolvedValue(undefined as any);
+
+      const handler = findHandler('post', '/mcp');
+      const { req, res } = createMockReqRes();
+      req.headers = {
+        authorization: `Bearer ${TEST_AUTH_TOKEN}`,
+        'x-n8n-url': 'https://tenant-n8n.example.com',
+        'x-n8n-mcp-token': 'has whitespace',
+      };
+      await handler(req, res);
+
+      assertSsrfRejection(res);
+      expect(spy).not.toHaveBeenCalled();
     });
   });
 

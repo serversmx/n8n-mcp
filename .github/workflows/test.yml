@@ -40,20 +40,29 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # Increased from 10 to accommodate larger database with community nodes
+    timeout-minutes: 60  # fork: the unit suite alone takes ~27 min on ubuntu-latest here, UI browser tests follow
+    env:
+      # A boolean flag (not the secrets themselves) recording whether a live n8n
+      # instance is configured, so the live-integration step can gate on it without
+      # the N8N_API_* values being exposed to every step in the job. The live tests
+      # need BOTH the URL and the key (getN8nCredentials() throws if either is
+      # missing), and both are empty on Dependabot/fork PRs — so require both here,
+      # otherwise a partially-configured instance would run the step and then fail.
+      HAS_N8N_INSTANCE: ${{ secrets.N8N_API_URL != '' && secrets.N8N_API_KEY != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
+          check-latest: true
           cache: 'npm'
       
       - name: Install dependencies
         # --legacy-peer-deps: n8n-nodes-base 2.20.x pulls in mappersmith with a `diff`
         # peer that conflicts with ts-node's `diff@^4`; npm 7+ strict resolution leaves
         # the lock internally inconsistent. Match local dev (.npmrc legacy-peer-deps=true).
-        run: npm install --legacy-peer-deps
+        run: npm ci --legacy-peer-deps
       
       # Verify test environment setup
       - name: Verify test environment
@@ -70,6 +79,49 @@ jobs:
         env:
           CI: true
       
+      # Compile to dist/ before the integration suites. Several of them spawn the
+      # real entrypoints as child processes (tests/integration/mcp/stdio-*.test.ts)
+      # and skip themselves when dist/ is absent — so without this step the stdio
+      # regression coverage silently never ran on CI at all.
+      - name: Build dist for entrypoint integration tests
+        run: npm run build
+
+      - name: Install UI dependencies
+        run: npm --prefix ui-apps ci
+
+      - name: Typecheck, test and build MCP cards
+        run: |
+          npm --prefix ui-apps run typecheck
+          npm --prefix ui-apps run test:coverage
+          npm --prefix ui-apps run build
+
+      - name: Verify UI resources and offline tool result over MCP
+        run: npm run ui:smoke
+
+      - name: Verify synthetic MCP host fixtures
+        run: npm run ui:fixtures:smoke
+
+      - name: Verify UI assets in the prepared npm tarball
+        run: |
+          npm run prepare:publish
+          node scripts/ui-npm-smoke.mjs
+          bash scripts/publish-npm-quick.sh
+          node scripts/ui-npm-smoke.mjs
+
+      - name: Install UI test browser
+        run: npm --prefix ui-apps exec -- playwright install --with-deps chromium
+
+      - name: Verify UI browser journeys and accessibility
+        run: npm --prefix ui-apps run test:browser
+
+      - name: Upload UI failure traces
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-test-traces
+          path: ui-apps/test-results/
+          if-no-files-found: ignore
+
       # Pre-build the Docker test image used by tests/integration/docker/*.test.ts
       # Two test files used to build it independently inside their beforeAll hooks; the
       # builder stage does an `npm install` from the public registry which intermittently
@@ -82,9 +134,24 @@ jobs:
         timeout-minutes: 8
         continue-on-error: true
 
-      # Run integration tests separately (with MSW setup)
-      - name: Run integration tests
-        run: npm run test:integration -- --reporter=default --reporter=junit
+      # Offline integration suites (database, security, mcp-protocol, workflow-diff,
+      # templates, docker, …). These need no live instance, so they always run and
+      # stay a blocking gate on every PR — Dependabot and forks included. Only the
+      # live n8n-api / ai-validation suites are excluded here (they run in the next
+      # step). MSW setup applies as configured.
+      - name: Run integration tests (offline suites)
+        run: npm run test:integration -- --exclude 'tests/integration/n8n-api/**' --exclude 'tests/integration/ai-validation/**' --reporter=default --reporter=junit
+        env:
+          CI: true
+
+      # Live n8n-API + AI-validation suites hit a real instance via the N8N_API_*
+      # secrets, which are unavailable on Dependabot and fork PRs (there every file
+      # here fails outright, turning the required `test` check permanently red). Skip
+      # them when no instance is configured; on in-repo PRs the secret is present so
+      # they run and remain a blocking gate. Secrets are scoped to this step only.
+      - name: Run integration tests (live n8n instance)
+        if: ${{ env.HAS_N8N_INSTANCE == 'true' }}
+        run: npm run test:integration -- tests/integration/n8n-api tests/integration/ai-validation --reporter=default --reporter=junit
         env:
           CI: true
           N8N_API_URL: ${{ secrets.N8N_API_URL }}
@@ -107,7 +174,7 @@ jobs:
       # Upload test results artifacts
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-results-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
@@ -120,7 +187,7 @@ jobs:
       # Upload coverage artifacts
       - name: Upload coverage reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
@@ -131,7 +198,7 @@ jobs:
       # Upload coverage to Codecov
       - name: Upload coverage to Codecov
         if: always()
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage/lcov.info
@@ -243,11 +310,38 @@ jobs:
       
       - name: Upload test metadata
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-metadata-${{ github.run_number }}-${{ github.run_attempt }}
           path: test-metadata.json
           retention-days: 30
+
+  # Verify the compiled CommonJS artifact loads under Node's CJS loader (regression guard for #864).
+  # Node 22.12+ silently tolerates require() of ESM-only deps; scripts/smoke-cjs-runtime.js
+  # forces the strict loader (--no-experimental-require-module) when the running Node supports it,
+  # so a CJS/ESM mismatch in a shipped dependency (e.g. uuid@14) fails here regardless of the
+  # runner's Node version. The unit suite runs under Vitest's ESM pipeline and cannot catch this;
+  # tsc only type-checks.
+  cjs-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          check-latest: true
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Build
+        run: npm run build
+
+      - name: Load compiled CommonJS artifact under strict CJS loader
+        run: npm run test:cjs-runtime
 
   # Publish test results as checks
   publish-results:
@@ -257,10 +351,10 @@ jobs:
     permissions:
       checks: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download test results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 

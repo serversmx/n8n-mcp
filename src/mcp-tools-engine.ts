@@ -4,7 +4,7 @@
  */
 import { NodeRepository } from './database/node-repository';
 import { PropertyFilter } from './services/property-filter';
-import { TaskTemplates } from './services/task-templates';
+import { parseTypeVersion } from './utils/typeversion';
 import { ConfigValidator } from './services/config-validator';
 import { EnhancedConfigValidator } from './services/enhanced-config-validator';
 import { WorkflowValidator, WorkflowValidationResult } from './services/workflow-validator';
@@ -33,7 +33,7 @@ export class MCPEngine {
     if (!node) return null;
     
     // Filter to essentials using static method
-    const essentials = PropertyFilter.getEssentials(node.properties || [], args.nodeType);
+    const essentials = PropertyFilter.getEssentials(node.properties || [], args.nodeType, parseTypeVersion(node.version) ?? undefined);
     return {
       nodeType: node.nodeType,
       displayName: node.displayName,
@@ -63,11 +63,17 @@ export class MCPEngine {
       };
     }
 
-    // CRITICAL FIX: Extract user-provided keys before validation
-    // This prevents false warnings about default values
-    const userProvidedKeys = new Set(Object.keys(args.config || {}));
-
-    return ConfigValidator.validate(args.nodeType, args.config, node.properties || [], userProvidedKeys);
+    // Routed through the enhanced validator so the embedding API sees the same
+    // node-specific checks as validate_node and workflow validation - it also
+    // derives the user-provided keys itself, which keeps default values from
+    // raising false warnings. The result is a superset of ValidationResult.
+    return EnhancedConfigValidator.validateWithMode(
+      args.nodeType,
+      args.config || {},
+      node.properties || [],
+      args.mode ?? 'operation',
+      args.profile ?? 'ai-friendly'
+    );
   }
 
   async validateNodeMinimal(args: any) {
@@ -78,7 +84,7 @@ export class MCPEngine {
     }
     
     const missingFields: string[] = [];
-    const requiredFields = PropertyFilter.getEssentials(node.properties || [], args.nodeType).required;
+    const requiredFields = PropertyFilter.getEssentials(node.properties || [], args.nodeType, parseTypeVersion(node.version) ?? undefined).required;
     
     for (const field of requiredFields) {
       if (!args.config[field.name]) {

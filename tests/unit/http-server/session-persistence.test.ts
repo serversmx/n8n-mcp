@@ -4,13 +4,35 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+
+// Mock the logger so we can assert on security-event emission. logSecurityEvent
+// in http-server-single-session.ts routes events through logger.info with a
+// `[SECURITY] <event>` prefix, so spying on logger.info lets us verify which
+// security events fire during restore.
+vi.mock('../../../src/utils/logger', () => ({
+  Logger: vi.fn().mockImplementation(() => ({
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn()
+  })),
+  logger: {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn()
+  }
+}));
+
 import { SingleSessionHTTPServer } from '../../../src/http-server-single-session';
 import { SessionState } from '../../../src/types/session-state';
+import { logger } from '../../../src/utils/logger';
 
 describe('SingleSessionHTTPServer - Session Persistence', () => {
   let server: SingleSessionHTTPServer;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     server = new SingleSessionHTTPServer();
   });
 
@@ -495,6 +517,163 @@ describe('SingleSessionHTTPServer - Session Persistence', () => {
     });
   });
 
+  describe('restoreSessionState() - partial tenant context hardening (#844)', () => {
+    // Helper: find logSecurityEvent emissions for a given event name.
+    // logSecurityEvent routes through logger.info(`[SECURITY] <event>`, details),
+    // so we inspect logger.info calls for the prefixed message.
+    const securityEventsFor = (event: string) =>
+      vi.mocked(logger.info).mock.calls.filter(
+        (call) => call[0] === `[SECURITY] ${event}`
+      );
+
+    it('should reject a context carrying only n8nApiUrl (key absent)', () => {
+      // Field is entirely absent (undefined), not empty string. This passes
+      // validateInstanceContext (which only checks fields that are !== undefined)
+      // but must still be rejected as a partial tenant identity.
+      const sessions: SessionState[] = [
+        {
+          sessionId: 'url-only-session',
+          metadata: {
+            createdAt: new Date().toISOString(),
+            lastAccess: new Date().toISOString()
+          },
+          context: {
+            n8nApiUrl: 'https://url-only.example.com',
+            instanceId: 'partial-instance'
+            // n8nApiKey absent
+          } as any
+        }
+      ];
+
+      const count = server.restoreSessionState(sessions);
+
+      expect(count).toBe(0);
+      const serverAny = server as any;
+      expect(serverAny.sessionMetadata['url-only-session']).toBeUndefined();
+      expect(serverAny.sessionContexts['url-only-session']).toBeUndefined();
+    });
+
+    it('should reject a context carrying only n8nApiKey (url absent)', () => {
+      const sessions: SessionState[] = [
+        {
+          sessionId: 'key-only-session',
+          metadata: {
+            createdAt: new Date().toISOString(),
+            lastAccess: new Date().toISOString()
+          },
+          context: {
+            n8nApiKey: 'key-only-secret',
+            instanceId: 'partial-instance'
+            // n8nApiUrl absent
+          } as any
+        }
+      ];
+
+      const count = server.restoreSessionState(sessions);
+
+      expect(count).toBe(0);
+      const serverAny = server as any;
+      expect(serverAny.sessionMetadata['key-only-session']).toBeUndefined();
+      expect(serverAny.sessionContexts['key-only-session']).toBeUndefined();
+    });
+
+    it('should emit a session_restore_failed security event for a partial context', () => {
+      const sessions: SessionState[] = [
+        {
+          sessionId: 'partial-event-session',
+          metadata: {
+            createdAt: new Date().toISOString(),
+            lastAccess: new Date().toISOString()
+          },
+          context: {
+            n8nApiUrl: 'https://partial.example.com'
+            // n8nApiKey absent
+          } as any
+        }
+      ];
+
+      server.restoreSessionState(sessions);
+
+      const events = securityEventsFor('session_restore_failed');
+      expect(events.length).toBeGreaterThanOrEqual(1);
+
+      const partialEvent = events.find(
+        (call) => (call[1] as any)?.sessionId === 'partial-event-session'
+      );
+      expect(partialEvent).toBeDefined();
+      expect((partialEvent![1] as any).reason).toContain(
+        'missing required tenant credentials'
+      );
+    });
+
+    it('should restore a complete context normally (control)', () => {
+      const sessions: SessionState[] = [
+        {
+          sessionId: 'complete-session',
+          metadata: {
+            createdAt: new Date().toISOString(),
+            lastAccess: new Date().toISOString()
+          },
+          context: {
+            n8nApiUrl: 'https://complete.example.com',
+            n8nApiKey: 'complete-key',
+            instanceId: 'complete-instance'
+          }
+        }
+      ];
+
+      const count = server.restoreSessionState(sessions);
+
+      expect(count).toBe(1);
+      const serverAny = server as any;
+      expect(serverAny.sessionMetadata['complete-session']).toBeDefined();
+      expect(serverAny.sessionContexts['complete-session']).toMatchObject({
+        n8nApiUrl: 'https://complete.example.com',
+        n8nApiKey: 'complete-key',
+        instanceId: 'complete-instance'
+      });
+
+      // The partial-context guard must NOT have fired for a complete context.
+      const events = securityEventsFor('session_restore_failed');
+      const completeEvent = events.find(
+        (call) => (call[1] as any)?.sessionId === 'complete-session'
+      );
+      expect(completeEvent).toBeUndefined();
+    });
+
+    it('should leave a no-context (single-tenant/stdio) session unaffected', () => {
+      // A session with no context at all is handled by the earlier null-context
+      // check and is skipped (not restored) WITHOUT being misclassified by the
+      // partial-credential guard. The guard must never run for it.
+      const sessions: any[] = [
+        {
+          sessionId: 'no-context-session',
+          metadata: {
+            createdAt: new Date().toISOString(),
+            lastAccess: new Date().toISOString()
+          }
+          // context omitted entirely
+        }
+      ];
+
+      const count = server.restoreSessionState(sessions);
+
+      // No-context sessions are not restorable (no instance to reconnect to).
+      expect(count).toBe(0);
+      const serverAny = server as any;
+      expect(serverAny.sessionMetadata['no-context-session']).toBeUndefined();
+
+      // The earlier `!sessionState.context` branch logs a plain warning and does
+      // NOT emit a session_restore_failed security event, so the partial-context
+      // guard provably did not run for this no-context session.
+      const events = securityEventsFor('session_restore_failed');
+      const noContextEvent = events.find(
+        (call) => (call[1] as any)?.sessionId === 'no-context-session'
+      );
+      expect(noContextEvent).toBeUndefined();
+    });
+  });
+
   describe('Round-trip export and restore', () => {
     it('should preserve data through export → restore cycle', () => {
       // Create sessions with current timestamps
@@ -541,6 +720,88 @@ describe('SingleSessionHTTPServer - Session Persistence', () => {
         sessionId: 'custom-id-1',
         metadata: { userId: 'user1', role: 'admin' }
       });
+    });
+
+    it('should preserve n8nMcpAccessToken and API tuning through export → restore (#1045)', () => {
+      // Regression: the export/restore field lists silently dropped every
+      // InstanceContext field they did not name, so restored sessions lost the
+      // instance-level MCP access token after every deploy and n8n_manage_agents
+      // reported NOT_CONFIGURED for a token that was still correctly stored.
+      const serverAny = server as any;
+      const now = new Date();
+
+      serverAny.sessionMetadata['session-token'] = {
+        createdAt: new Date(now.getTime() - 60 * 1000),
+        lastAccess: new Date(now.getTime() - 30 * 1000)
+      };
+      serverAny.sessionContexts['session-token'] = {
+        n8nApiUrl: 'https://n8n1.example.com',
+        n8nApiKey: 'key1',
+        n8nMcpAccessToken: 'mcp-access-token-1',
+        n8nApiTimeout: 45000,
+        n8nApiMaxRetries: 5,
+        instanceId: 'instance1',
+        sessionId: 'session-token',
+        metadata: { userId: 'user1' }
+      };
+
+      const exported = server.exportSessionState();
+      expect(exported).toHaveLength(1);
+      expect(exported[0].context.n8nMcpAccessToken).toBe('mcp-access-token-1');
+      expect(exported[0].context.n8nApiTimeout).toBe(45000);
+      expect(exported[0].context.n8nApiMaxRetries).toBe(5);
+
+      delete serverAny.sessionMetadata['session-token'];
+      delete serverAny.sessionContexts['session-token'];
+
+      const count = server.restoreSessionState(exported);
+      expect(count).toBe(1);
+
+      expect(serverAny.sessionContexts['session-token']).toMatchObject({
+        n8nApiUrl: 'https://n8n1.example.com',
+        n8nApiKey: 'key1',
+        n8nMcpAccessToken: 'mcp-access-token-1',
+        n8nApiTimeout: 45000,
+        n8nApiMaxRetries: 5,
+        instanceId: 'instance1'
+      });
+    });
+
+    it('should keep undeclared context properties out of export and restore', () => {
+      // Structural typing lets an embedder hand over a larger record than
+      // InstanceContext; only declared fields may cross the persistence boundary
+      // in either direction.
+      const serverAny = server as any;
+      const now = new Date();
+
+      serverAny.sessionMetadata['session-extra'] = {
+        createdAt: new Date(now.getTime() - 60 * 1000),
+        lastAccess: new Date(now.getTime() - 30 * 1000)
+      };
+      serverAny.sessionContexts['session-extra'] = {
+        n8nApiUrl: 'https://n8n1.example.com',
+        n8nApiKey: 'key1',
+        instanceId: 'instance1',
+        oauthRefreshToken: 'must-not-be-exported'
+      };
+
+      const exported = server.exportSessionState();
+      expect(exported).toHaveLength(1);
+      expect(exported[0].context).not.toHaveProperty('oauthRefreshToken');
+
+      delete serverAny.sessionMetadata['session-extra'];
+      delete serverAny.sessionContexts['session-extra'];
+
+      // Restore must equally drop unknown keys arriving from persisted JSON.
+      const tampered = [
+        {
+          ...exported[0],
+          context: { ...exported[0].context, injectedKey: 'must-not-be-restored' } as any
+        }
+      ];
+      expect(server.restoreSessionState(tampered)).toBe(1);
+      expect(serverAny.sessionContexts['session-extra']).not.toHaveProperty('injectedKey');
+      expect(serverAny.sessionContexts['session-extra'].n8nApiKey).toBe('key1');
     });
   });
 });

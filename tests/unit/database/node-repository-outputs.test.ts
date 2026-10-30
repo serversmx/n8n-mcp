@@ -88,11 +88,11 @@ describe('NodeRepository - Outputs Handling', () => {
         0, // hasToolVariant
         '3', // version
         null, // documentation
-        JSON.stringify([], null, 2), // properties
-        JSON.stringify([], null, 2), // operations
-        JSON.stringify([], null, 2), // credentials
-        JSON.stringify(outputs, null, 2), // outputs
-        JSON.stringify(outputNames, null, 2), // output_names
+        JSON.stringify([]), // properties
+        JSON.stringify([]), // operations
+        JSON.stringify([]), // credentials
+        JSON.stringify(outputs), // outputs
+        JSON.stringify(outputNames), // output_names
         0, // is_community
         0, // is_verified
         null, // author_name
@@ -103,7 +103,8 @@ describe('NodeRepository - Outputs Handling', () => {
         null, // community_fetched_at
         null, // npm_readme (preserved from existing)
         null, // ai_documentation_summary (preserved from existing)
-        null  // ai_summary_generated_at (preserved from existing)
+        null, // ai_summary_generated_at (preserved from existing)
+        null  // deprecated_versions
       );
     });
 
@@ -135,7 +136,7 @@ describe('NodeRepository - Outputs Handling', () => {
       repository.saveNode(node);
 
       const callArgs = mockStatement.run.mock.calls[0];
-      expect(callArgs[18]).toBe(JSON.stringify(outputs, null, 2)); // outputs
+      expect(callArgs[18]).toBe(JSON.stringify(outputs)); // outputs
       expect(callArgs[19]).toBe(null); // output_names should be null
     });
 
@@ -165,7 +166,7 @@ describe('NodeRepository - Outputs Handling', () => {
 
       const callArgs = mockStatement.run.mock.calls[0];
       expect(callArgs[18]).toBe(null); // outputs should be null
-      expect(callArgs[19]).toBe(JSON.stringify(outputNames, null, 2)); // output_names
+      expect(callArgs[19]).toBe(JSON.stringify(outputNames)); // output_names
     });
 
     it('should save node without outputs or outputNames', () => {
@@ -217,8 +218,8 @@ describe('NodeRepository - Outputs Handling', () => {
       repository.saveNode(node);
 
       const callArgs = mockStatement.run.mock.calls[0];
-      expect(callArgs[18]).toBe(JSON.stringify([], null, 2)); // outputs
-      expect(callArgs[19]).toBe(JSON.stringify([], null, 2)); // output_names
+      expect(callArgs[18]).toBe(JSON.stringify([])); // outputs
+      expect(callArgs[19]).toBe(JSON.stringify([])); // output_names
     });
   });
 
@@ -282,6 +283,7 @@ describe('NodeRepository - Outputs Handling', () => {
         isToolVariant: false,
         toolVariantOf: null,
         hasToolVariant: false,
+        deprecatedVersions: [],
         version: '3',
         properties: [],
         operations: [],

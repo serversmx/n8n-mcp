@@ -15,7 +15,7 @@ export interface HealthCheckResponse {
   apiUrl: string;
   mcpVersion: string;
   supportedN8nVersion?: string;
-  versionNote?: string;
+  n8nVersionNote?: string;
   [key: string]: any; // Allow dynamic property access for optional field checks
 }
 
@@ -72,7 +72,8 @@ export interface DiagnosticResponse {
   versionInfo?: {
     current: string;
     latest: string | null;
-    upToDate: boolean;
+    upToDate: boolean | null;
+    checkStatus: 'ok' | 'failed' | 'disabled';
     message: string;
     updateCommand?: string;
   };

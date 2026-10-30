@@ -22,6 +22,7 @@ import { isN8nApiConfigured } from './config/n8n-api';
 import dotenv from 'dotenv';
 import { readFileSync } from 'fs';
 import { getStartupBaseUrl, formatEndpointUrls, detectBaseUrl } from './utils/url-detector';
+import { SERVER_INSTRUCTIONS } from './mcp/native-first';
 import { 
   negotiateProtocolVersion, 
   logProtocolNegotiation,
@@ -43,6 +44,12 @@ interface MCPToolResponse {
 
 let expressServer: any;
 let authToken: string | null = null;
+
+// Placeholder token shipped in the deployment templates.
+const DEFAULT_AUTH_TOKEN = 'REPLACE_THIS_AUTH_TOKEN_32_CHARS_MIN_abcdefgh';
+
+// Largest accepted POST /mcp body, matching the default server's JSON parser limit.
+const MAX_BODY_BYTES = 10 * 1024 * 1024;
 
 /**
  * Load auth token from environment variable or file
@@ -95,7 +102,16 @@ function validateEnvironment() {
   }
   
   // Check for default token and show prominent warnings
-  if (authToken === 'REPLACE_THIS_AUTH_TOKEN_32_CHARS_MIN_abcdefgh') {
+  if (authToken === DEFAULT_AUTH_TOKEN) {
+    // SECURITY (GHSA-7mg3-m9wx-m555): refuse the shipped placeholder token in production.
+    if (process.env.NODE_ENV === 'production') {
+      const message = 'CRITICAL SECURITY ERROR: Cannot start in production with default AUTH_TOKEN. Generate secure token: openssl rand -base64 32';
+      logger.error(message);
+      console.error(message);
+      console.error('Set NODE_ENV to development for testing, or update AUTH_TOKEN for production');
+      process.exit(1);
+    }
+
     logger.warn('⚠️ SECURITY WARNING: Using default AUTH_TOKEN - CHANGE IMMEDIATELY!');
     logger.warn('Generate secure token with: openssl rand -base64 32');
     
@@ -368,14 +384,47 @@ export async function startFixedHTTPServer() {
       // Instead of using StreamableHTTPServerTransport, we'll handle the request directly
       // This avoids the initialization issues with the transport
       
+      // SECURITY (GHSA-xvxq-x6hr-xc2c): cap the request body size.
+      const rejectTooLarge = () => {
+        res.setHeader('Connection', 'close');
+        res.on('finish', () => req.destroy());
+        res.status(413).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32600,
+            message: 'Request body too large'
+          },
+          id: null
+        });
+      };
+
+      const declaredLength = Number(req.headers['content-length']);
+      if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) {
+        rejectTooLarge();
+        return;
+      }
+
       // Collect the raw body
-      let body = '';
-      req.on('data', chunk => {
-        body += chunk.toString();
+      const chunks: Buffer[] = [];
+      let receivedBytes = 0;
+      let tooLarge = false;
+      req.on('data', (chunk: Buffer) => {
+        if (tooLarge) return;
+        receivedBytes += chunk.length;
+        if (receivedBytes > MAX_BODY_BYTES) {
+          tooLarge = true;
+          chunks.length = 0;
+          req.pause();
+          rejectTooLarge();
+          return;
+        }
+        chunks.push(chunk);
       });
       
       req.on('end', async () => {
+        if (tooLarge) return;
         try {
+          const body = Buffer.concat(chunks).toString();
           const jsonRpcRequest = JSON.parse(body);
           logger.debug('Received JSON-RPC request:', { method: jsonRpcRequest.method });
           
@@ -405,7 +454,8 @@ export async function startFixedHTTPServer() {
                   serverInfo: {
                     name: 'n8n-documentation-mcp',
                     version: PROJECT_VERSION
-                  }
+                  },
+                  instructions: SERVER_INSTRUCTIONS
                 },
                 id: jsonRpcRequest.id
               };
@@ -580,7 +630,7 @@ export async function startFixedHTTPServer() {
     console.log('\nPress Ctrl+C to stop the server');
     
     // Start periodic warning timer if using default token
-    if (authToken === 'REPLACE_THIS_AUTH_TOKEN_32_CHARS_MIN_abcdefgh') {
+    if (authToken === DEFAULT_AUTH_TOKEN) {
       setInterval(() => {
         logger.warn('⚠️ Still using default AUTH_TOKEN - security risk!');
         if (process.env.MCP_MODE === 'http') {

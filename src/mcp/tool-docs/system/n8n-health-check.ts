@@ -48,15 +48,17 @@ Health checks are crucial for:
     },
     returns: `Health status object containing:
 - status: Overall health status ('healthy', 'degraded', 'error')
-- n8nVersion: n8n instance version information
+- n8nVersion: n8n instance version, when the instance reports one. n8n stopped exposing its version to API clients in 1.119.0, so this is usually absent; n8nVersionNote then says so. Neither an error nor worth retrying - check capabilities by calling the API, not by comparing versions
+- n8nVersionNote: Present only when n8nVersion is absent, explaining why
 - instanceId: Unique identifier for the n8n instance
 - features: Object listing available features and their status
 - mcpVersion: Current n8n-mcp version
 - supportedN8nVersion: Recommended n8n version for compatibility
 - versionCheck: Version status information
   - current: Current n8n-mcp version
-  - latest: Latest available version from npm
-  - upToDate: Boolean indicating if version is current
+  - latest: Latest available version from npm, or null when unknown
+  - upToDate: true or false when npm answered; null when the check failed or is disabled (unknown, not "up to date")
+  - checkStatus: "ok", "failed" (npm registry unreachable or invalid reply) or "disabled" (N8N_MCP_VERSION_CHECK_DISABLED=true or 1, no request made)
   - message: Formatted version status message
   - updateCommand: Command to update (if outdated)
 - performance: Performance metrics
@@ -67,8 +69,8 @@ Health checks are crucial for:
 - updateWarning: Warning if version is outdated (if applicable)`,
     examples: [
       'n8n_health_check({}) - Complete health check with version and performance data',
-      '// Use in monitoring scripts\nconst health = await n8n_health_check({});\nif (health.status !== "ok") alert("n8n is down!");\nif (!health.versionCheck.upToDate) console.log("Update available:", health.versionCheck.updateCommand);',
-      '// Check before critical operations\nconst health = await n8n_health_check({});\nif (health.performance.responseTimeMs > 1000) console.warn("n8n is slow");\nif (health.versionCheck.isOutdated) console.log(health.updateWarning);'
+      '// Use in monitoring scripts\nconst health = await n8n_health_check({});\nif (health.status !== "ok") alert("n8n is down!");\nif (health.versionCheck.upToDate === false) console.log("Update available:", health.versionCheck.updateCommand);',
+      '// Check before critical operations\nconst health = await n8n_health_check({});\nif (health.performance.responseTimeMs > 1000) console.warn("n8n is slow");\nif (health.updateWarning) console.log(health.updateWarning);'
     ],
     useCases: [
       'Pre-flight checks before workflow deployments',

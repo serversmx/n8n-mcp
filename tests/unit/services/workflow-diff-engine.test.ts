@@ -215,6 +215,102 @@ describe('WorkflowDiffEngine', () => {
       expect(result.errors![0].message).toContain('Use "n8n-nodes-base.');
     });
 
+    it.each([
+      { label: 'a string', node: 'strayString', expected: 'addNode requires a node object, received a string' },
+      { label: 'null', node: null, expected: 'addNode requires a node object, received null' },
+      { label: 'an array', node: [], expected: 'addNode requires a node object, received an array' },
+      { label: 'a number', node: 123, expected: 'addNode requires a node object, received a number' },
+      {
+        label: 'a node with no name',
+        node: { type: 'n8n-nodes-base.code', position: [800, 300] },
+        expected: 'addNode requires a string "name" on the node, received nothing',
+      },
+      {
+        label: 'a node with a non-string name',
+        node: { name: 123, type: 'n8n-nodes-base.code', position: [800, 300] },
+        expected: 'addNode requires a string "name" on the node, received a number',
+      },
+      {
+        label: 'a node with no type',
+        node: { name: 'No Type', position: [800, 300] },
+        expected: 'addNode requires a string "type" on the node, received nothing',
+      },
+      {
+        label: 'a node with a non-string type',
+        node: { name: 'Bad Type', type: 123, position: [800, 300] },
+        expected: 'addNode requires a string "type" on the node, received a number',
+      },
+    ])('should reject $label with a validation error, not a TypeError', async ({ node, expected }) => {
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [{ type: 'addNode', node } as unknown as AddNodeOperation]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].operation).toBe(0);
+      expect(result.errors![0].message).toBe(expected);
+    });
+
+    // The reordering pass that hoists an addNode above an earlier connection operation
+    // inspects node.name/node.id before any validator runs, so a malformed payload has to
+    // survive it - otherwise the operation index is lost and the TypeError comes back.
+    it('should keep the operation index when a connection operation precedes a malformed addNode', async () => {
+      // The connection operation is valid and between existing nodes, so the malformed addNode
+      // is the only thing that can fail - the assertion then pins the guard directly instead of
+      // passing on some earlier error.
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [
+          { type: 'addConnection', source: 'Webhook', target: 'Slack' },
+          { type: 'addNode', node: null },
+        ] as unknown as WorkflowDiffOperation[]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].operation).toBe(1);
+      expect(result.errors![0].message).toBe('addNode requires a node object, received null');
+    });
+
+    it('should report a malformed addNode against its own index alongside other failures', async () => {
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        continueOnError: true,
+        operations: [
+          { type: 'addConnection', source: 'Webhook', target: 'New Node' },
+          { type: 'addNode', node: null },
+        ] as unknown as WorkflowDiffOperation[]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.errors).toContainEqual(expect.objectContaining({
+        operation: 1,
+        message: 'addNode requires a node object, received null',
+      }));
+    });
+
+    // The shape check must not require position: a batch may add a node and place it with a
+    // later moveNode. Only the post-apply structure check knows whether one ever arrived.
+    it('should accept an addNode without position when a later moveNode supplies it', async () => {
+      // No cast: AddNodeOperation declares position optional precisely because of this batch.
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [
+          { type: 'addNode', node: { name: 'Late Position', type: 'n8n-nodes-base.noOp' } },
+          { type: 'moveNode', nodeName: 'Late Position', position: [900, 400] },
+        ]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(true);
+      expect(result.workflow!.nodes.find((n: any) => n.name === 'Late Position')!.position).toEqual([900, 400]);
+    });
+
     it('should generate node ID if not provided', async () => {
       const operation: AddNodeOperation = {
         type: 'addNode',
@@ -318,6 +414,75 @@ describe('WorkflowDiffEngine', () => {
   });
 
   describe('UpdateNode Operation', () => {
+    // `updates` and `connections` are z.any() on the wire; a primitive reached the `in`
+    // operator and Object.entries respectively, losing the operation index to the outer catch.
+    it.each([
+      { label: 'a string', updates: 'hello' },
+      { label: 'a number', updates: 7 },
+      { label: 'a boolean', updates: true },
+      { label: 'an array', updates: [] },
+    ])('should reject updates that are $label', async ({ updates }) => {
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [{ type: 'updateNode', nodeName: 'Webhook', updates } as unknown as UpdateNodeOperation]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].operation).toBe(0);
+      expect(result.errors![0].message).toContain("requires 'updates' to be an object");
+    });
+
+    it('should reject a rename to a non-string name', async () => {
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [{ type: 'updateNode', nodeName: 'Webhook', updates: { name: 123 } } as unknown as UpdateNodeOperation]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].operation).toBe(0);
+      expect(result.errors![0].message).toContain("'updates.name' must be a string");
+    });
+
+    it.each([
+      { label: 'a null output map', connections: { Webhook: null }, expected: 'must be an object keyed by output name' },
+      { label: 'a non-array output', connections: { Webhook: { main: 'nope' } }, expected: 'must be an array of output arrays' },
+      { label: 'a non-array connection list', connections: { Webhook: { main: ['nope'] } }, expected: 'must contain arrays of connections' },
+      { label: 'a null connection', connections: { Webhook: { main: [[null]] } }, expected: 'must be an object with a string "node"' },
+    ])('should reject replaceConnections containing $label', async ({ connections, expected }) => {
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [{ type: 'replaceConnections', connections } as unknown as WorkflowDiffOperation]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].operation).toBe(0);
+      expect(result.errors![0].message).toContain(expected);
+    });
+
+    it.each([
+      { label: 'absent', operation: { type: 'replaceConnections' } },
+      { label: 'null', operation: { type: 'replaceConnections', connections: null } },
+      { label: 'a string', operation: { type: 'replaceConnections', connections: 'main' } },
+    ])('should reject replaceConnections whose connections are $label', async ({ operation }) => {
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [operation as unknown as WorkflowDiffOperation]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].operation).toBe(0);
+      expect(result.errors![0].message).toContain("requires a 'connections' object");
+    });
+
+
     it('should update node parameters', async () => {
       const operation: UpdateNodeOperation = {
         type: 'updateNode',
@@ -475,6 +640,37 @@ describe('WorkflowDiffEngine', () => {
       expect(codeNode?.parameters.jsCode).toBe('const x = 1;\nreturn x + 3;');
     });
 
+    it('should insert __patch_find_replace replacement literally when it contains $ patterns (#1012)', async () => {
+      const workflow = JSON.parse(JSON.stringify(baseWorkflow));
+      workflow.nodes.push({
+        id: 'code-1',
+        name: 'Code',
+        type: 'n8n-nodes-base.code',
+        typeVersion: 1,
+        position: [900, 300],
+        parameters: { jsCode: '// anchor\nreturn items;' }
+      });
+
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test',
+        operations: [{
+          type: 'updateNode' as const,
+          nodeName: 'Code',
+          updates: {
+            'parameters.jsCode': {
+              __patch_find_replace: [
+                { find: '// anchor', replace: "const money = '$' + total;" }
+              ]
+            }
+          }
+        }]
+      });
+
+      expect(result.success).toBe(true);
+      const codeNode = result.workflow.nodes.find((n: any) => n.name === 'Code');
+      expect(codeNode?.parameters.jsCode).toBe("const money = '$' + total;\nreturn items;");
+    });
+
     it('should apply multiple sequential __patch_find_replace patches', async () => {
       const workflow = JSON.parse(JSON.stringify(baseWorkflow));
       workflow.nodes.push({
@@ -594,6 +790,220 @@ describe('WorkflowDiffEngine', () => {
       expect(result.success).toBe(true);
       expect(result.warnings).toBeDefined();
       expect(result.warnings!.some(w => w.message.includes('not found'))).toBe(true);
+    });
+
+    it('should let __patch_find_replace edit a field that was already broken before patching', async () => {
+      const workflow = JSON.parse(JSON.stringify(baseWorkflow));
+      workflow.nodes.push({
+        id: 'code-1',
+        name: 'Code',
+        type: 'n8n-nodes-base.code',
+        typeVersion: 1,
+        position: [900, 300],
+        parameters: { jsCode: 'const x = (;\nreturn x;' }
+      });
+
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test',
+        operations: [{
+          type: 'updateNode' as const,
+          nodeName: 'Code',
+          updates: {
+            'parameters.jsCode': {
+              __patch_find_replace: [
+                // Still broken afterwards — allowed, the field was broken before
+                { find: 'return x;', replace: 'return x + 1;' }
+              ]
+            }
+          }
+        }]
+      });
+
+      expect(result.success).toBe(true);
+      const codeNode = result.workflow!.nodes.find((n: any) => n.name === 'Code');
+      expect(codeNode?.parameters.jsCode).toBe('const x = (;\nreturn x + 1;');
+    });
+
+    it('should reject __patch_find_replace patches that leave jsCode with a syntax error', async () => {
+      const original = 'const items = getItems();\nreturn items.filter(i => i.ok);';
+      const workflow = JSON.parse(JSON.stringify(baseWorkflow));
+      workflow.nodes.push({
+        id: 'code-1',
+        name: 'Code',
+        type: 'n8n-nodes-base.code',
+        typeVersion: 1,
+        position: [900, 300],
+        parameters: { jsCode: original }
+      });
+
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test',
+        operations: [{
+          type: 'updateNode' as const,
+          nodeName: 'Code',
+          updates: {
+            'parameters.jsCode': {
+              __patch_find_replace: [
+                // Removes the closing paren of filter(...) — corrupts the code
+                { find: 'i.ok);', replace: 'i.ok;' }
+              ]
+            }
+          }
+        }]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors?.[0]?.message).toContain('invalid JavaScript');
+      const codeNode = workflow.nodes.find((n: any) => n.name === 'Code');
+      expect(codeNode?.parameters.jsCode).toBe(original);
+    });
+
+    it.each([false, true])('should validate connection operations before later rename projections when validateOnly=%s', async (validateOnly) => {
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        validateOnly,
+        operations: [
+          {
+            type: 'removeConnection',
+            source: 'Webhook',
+            target: 'HTTP Request'
+          },
+          {
+            type: 'removeConnection',
+            source: 'HTTP Request',
+            target: 'Slack'
+          },
+          {
+            type: 'removeNode',
+            nodeName: 'HTTP Request'
+          },
+          {
+            type: 'updateNode',
+            nodeName: 'Webhook',
+            updates: {
+              name: 'HTTP Request'
+            }
+          },
+          {
+            type: 'addConnection',
+            source: 'HTTP Request',
+            target: 'Slack'
+          }
+        ]
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.errors).toBeUndefined();
+
+      const renamedNode = result.workflow!.nodes.find((node: any) => node.id === 'webhook-1');
+      expect(renamedNode?.name).toBe('HTTP Request');
+      expect(result.workflow!.nodes.some((node: any) => node.name === 'Webhook')).toBe(false);
+      expect(result.workflow!.connections['HTTP Request']?.main?.[0]).toEqual([
+        { node: 'Slack', type: 'main', index: 0 }
+      ]);
+    });
+
+    it('should apply the #788 rename batch under continueOnError mode', async () => {
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        continueOnError: true,
+        operations: [
+          { type: 'removeConnection', source: 'Webhook', target: 'HTTP Request' },
+          { type: 'removeConnection', source: 'HTTP Request', target: 'Slack' },
+          { type: 'removeNode', nodeName: 'HTTP Request' },
+          { type: 'updateNode', nodeName: 'Webhook', updates: { name: 'HTTP Request' } },
+          { type: 'addConnection', source: 'HTTP Request', target: 'Slack' }
+        ]
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.errors).toBeUndefined();
+      expect(result.applied).toEqual([0, 1, 2, 3, 4]);
+      expect(result.workflow!.connections['HTTP Request']?.main?.[0]).toEqual([
+        { node: 'Slack', type: 'main', index: 0 }
+      ]);
+    });
+
+    it('should hoist a later addNode referenced by an earlier addConnection (legacy pattern)', async () => {
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [
+          { type: 'addConnection', source: 'Slack', target: 'Notifier' },
+          {
+            type: 'addNode',
+            node: {
+              name: 'Notifier',
+              type: 'n8n-nodes-base.set',
+              position: [800, 300],
+              parameters: {}
+            }
+          }
+        ]
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.errors).toBeUndefined();
+      expect(result.workflow!.nodes.some((n: any) => n.name === 'Notifier')).toBe(true);
+      expect(result.workflow!.connections['Slack']?.main?.[0]).toEqual([
+        { node: 'Notifier', type: 'main', index: 0 }
+      ]);
+    });
+
+    it('should reject a removeConnection that references a node added later in the batch', async () => {
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [
+          { type: 'removeConnection', source: 'Phantom', target: 'Slack' },
+          {
+            type: 'addNode',
+            node: {
+              name: 'Phantom',
+              type: 'n8n-nodes-base.set',
+              position: [800, 300],
+              parameters: {}
+            }
+          }
+        ]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors?.[0]?.operation).toBe(0);
+      expect(result.errors?.[0]?.message).toContain('Source node not found');
+    });
+
+    it('should not leak rename tracking when an updateNode apply throws after the rename was recorded', async () => {
+      // updateNode validation does not reject forbidden path keys, but
+      // setNestedProperty throws on them. With the keys ordered so the
+      // forbidden path is iterated before "name", applyUpdateNode throws
+      // *after* recording the rename intent but *before* the rename actually
+      // lands on node.name. Without the commit-after-success guard, the next
+      // successful op's flushPendingRenames would rewrite connection
+      // references to a name no node carries — silently corrupting the graph.
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        continueOnError: true,
+        operations: [
+          {
+            type: 'updateNode',
+            nodeName: 'Webhook',
+            updates: {
+              '__proto__.polluted': 'x',
+              name: 'CodeRunner'
+            }
+          } as any,
+          // Drives flushPendingRenames. If renameMap leaked, the connection
+          // key "Webhook" would be rewritten to "CodeRunner" — leaving an
+          // orphaned key referencing a node that doesn't exist under that name.
+          { type: 'addTag', tag: 'sentinel' }
+        ]
+      });
+
+      expect(result.failed).toContain(0);
+      expect(result.applied).toContain(1);
+      // Source workflow's "Webhook" must still own its outgoing connection.
+      expect(result.workflow!.connections['Webhook']).toBeDefined();
+      expect(result.workflow!.connections['CodeRunner']).toBeUndefined();
+      expect(result.workflow!.nodes.some((n: any) => n.name === 'CodeRunner')).toBe(false);
     });
   });
 
@@ -728,6 +1138,87 @@ describe('WorkflowDiffEngine', () => {
       expect(result.success).toBe(true);
       const codeNode = result.workflow.nodes.find((n: any) => n.name === 'Code');
       expect(codeNode?.parameters.jsCode).toBe('const a = 10;\nconst b = 20;\nreturn a + b;');
+    });
+
+    it('should insert replacement text literally when it contains $ patterns (#1012)', async () => {
+      const workflow = JSON.parse(JSON.stringify(baseWorkflow));
+      workflow.nodes.push({
+        id: 'code-1',
+        name: 'Code',
+        type: 'n8n-nodes-base.code',
+        typeVersion: 1,
+        position: [900, 300],
+        parameters: { jsCode: '// anchor\nconst rest = 1;\nreturn rest;' }
+      });
+
+      // "$'" is the dangerous case from #1012: a bare-string replacer would
+      // splice everything after the match into the insertion.
+      const replacement = "const money = '$' + amount.toFixed(2); // $& $` $' $1 $$ $<name>";
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test',
+        operations: [{
+          type: 'patchNodeField' as const,
+          nodeName: 'Code',
+          fieldPath: 'parameters.jsCode',
+          patches: [{ find: '// anchor', replace: replacement }]
+        }]
+      });
+
+      expect(result.success).toBe(true);
+      const codeNode = result.workflow.nodes.find((n: any) => n.name === 'Code');
+      expect(codeNode?.parameters.jsCode).toBe(`${replacement}\nconst rest = 1;\nreturn rest;`);
+    });
+
+    it('should keep $ literal in literal mode with replaceAll', async () => {
+      const workflow = JSON.parse(JSON.stringify(baseWorkflow));
+      workflow.nodes.push({
+        id: 'code-1',
+        name: 'Code',
+        type: 'n8n-nodes-base.code',
+        typeVersion: 1,
+        position: [900, 300],
+        parameters: { jsCode: 'const a = AMOUNT;\nconst b = AMOUNT;' }
+      });
+
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test',
+        operations: [{
+          type: 'patchNodeField' as const,
+          nodeName: 'Code',
+          fieldPath: 'parameters.jsCode',
+          patches: [{ find: 'AMOUNT', replace: "'$' + n", replaceAll: true }]
+        }]
+      });
+
+      expect(result.success).toBe(true);
+      const codeNode = result.workflow.nodes.find((n: any) => n.name === 'Code');
+      expect(codeNode?.parameters.jsCode).toBe("const a = '$' + n;\nconst b = '$' + n;");
+    });
+
+    it('should support capture group references in regex mode replacements', async () => {
+      const workflow = JSON.parse(JSON.stringify(baseWorkflow));
+      workflow.nodes.push({
+        id: 'code-1',
+        name: 'Code',
+        type: 'n8n-nodes-base.code',
+        typeVersion: 1,
+        position: [900, 300],
+        parameters: { jsCode: 'const limit = 42;' }
+      });
+
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test',
+        operations: [{
+          type: 'patchNodeField' as const,
+          nodeName: 'Code',
+          fieldPath: 'parameters.jsCode',
+          patches: [{ find: 'const limit = (\\d+)', replace: 'const limit = $1 * 2', regex: true }]
+        }]
+      });
+
+      expect(result.success).toBe(true);
+      const codeNode = result.workflow.nodes.find((n: any) => n.name === 'Code');
+      expect(codeNode?.parameters.jsCode).toBe('const limit = 42 * 2;');
     });
 
     it('should support regex pattern matching', async () => {
@@ -1108,6 +1599,361 @@ describe('WorkflowDiffEngine', () => {
       expect(result.success).toBe(true);
       const codeNode = result.workflow.nodes.find((n: any) => n.id === 'code-1');
       expect(codeNode?.parameters.jsCode).toBe('const x = 2;');
+    });
+
+    describe('JavaScript syntax guard on code fields', () => {
+      const codeWorkflow = (jsCode: string) => {
+        const workflow = JSON.parse(JSON.stringify(baseWorkflow));
+        workflow.nodes.push({
+          id: 'code-1',
+          name: 'Code',
+          type: 'n8n-nodes-base.code',
+          typeVersion: 1,
+          position: [900, 300],
+          parameters: { jsCode }
+        });
+        return workflow;
+      };
+
+      it('should reject a patch that leaves parameters.jsCode with a syntax error, without touching the workflow', async () => {
+        const original = 'const items = getItems();\nreturn items.filter(i => i.ok);';
+        const workflow = codeWorkflow(original);
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeName: 'Code',
+            fieldPath: 'parameters.jsCode',
+            // Removes the closing paren of filter(...) — corrupts the code
+            patches: [{ find: 'i.ok);', replace: 'i.ok;' }]
+          }]
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.errors?.[0]?.message).toContain('invalid JavaScript');
+        expect(result.errors?.[0]?.message).toContain('parameters.jsCode');
+        const codeNode = workflow.nodes.find((n: any) => n.name === 'Code');
+        expect(codeNode?.parameters.jsCode).toBe(original);
+      });
+
+      it('should not block patches to a field that was already broken before patching', async () => {
+        // Incremental repair of pre-existing corruption (e.g. saved by the
+        // pre-2.71.1 bug) must not be blamed on the patch.
+        const workflow = codeWorkflow('const items = getItems(;\nreturn items.filter(i => i.ok);');
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeName: 'Code',
+            fieldPath: 'parameters.jsCode',
+            // Fixes one problem while the code stays broken overall
+            patches: [{ find: 'i => i.ok);', replace: 'i => i.ok;' }]
+          }]
+        });
+
+        expect(result.success).toBe(true);
+        const codeNode = result.workflow.nodes.find((n: any) => n.name === 'Code');
+        expect(codeNode?.parameters.jsCode).toBe('const items = getItems(;\nreturn items.filter(i => i.ok;');
+      });
+
+      it('should accept patched code with top-level return and await', async () => {
+        const workflow = codeWorkflow('const res = await fetch(url);\nreturn res;');
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeName: 'Code',
+            fieldPath: 'parameters.jsCode',
+            patches: [{ find: 'fetch(url)', replace: 'fetch(url, { method: "POST" })' }]
+          }]
+        });
+
+        expect(result.success).toBe(true);
+      });
+
+      it('should only check the final result of one operation\'s patches array', async () => {
+        const workflow = codeWorkflow('function pick(item) { return item.id; }\nreturn items.map(pick);');
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeName: 'Code',
+            fieldPath: 'parameters.jsCode',
+            // First patch alone leaves an unbalanced brace; second restores balance
+            patches: [
+              { find: 'return item.id; }', replace: 'return item.id ?? null;' },
+              { find: '?? null;', replace: '?? null; }' }
+            ]
+          }]
+        });
+
+        expect(result.success).toBe(true);
+        const codeNode = result.workflow.nodes.find((n: any) => n.name === 'Code');
+        expect(codeNode?.parameters.jsCode).toBe(
+          'function pick(item) { return item.id ?? null; }\nreturn items.map(pick);'
+        );
+      });
+
+      it('should allow a patch that repairs previously broken code', async () => {
+        const workflow = codeWorkflow('const x = (;\nreturn x;');
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeName: 'Code',
+            fieldPath: 'parameters.jsCode',
+            patches: [{ find: 'const x = (;', replace: 'const x = 1;' }]
+          }]
+        });
+
+        expect(result.success).toBe(true);
+        const codeNode = result.workflow.nodes.find((n: any) => n.name === 'Code');
+        expect(codeNode?.parameters.jsCode).toBe('const x = 1;\nreturn x;');
+      });
+
+      it('should guard the result of regex-mode patches too', async () => {
+        const workflow = codeWorkflow('const limit = 10;\nreturn limit;');
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeName: 'Code',
+            fieldPath: 'parameters.jsCode',
+            patches: [{ find: 'const limit = (\\d+);', replace: 'const limit = $1)(', regex: true }]
+          }]
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.errors?.[0]?.message).toContain('invalid JavaScript');
+      });
+
+      it('should never execute the checked code', async () => {
+        delete (globalThis as any).__syntaxGuardSentinel;
+        const workflow = codeWorkflow('return 1;');
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeName: 'Code',
+            fieldPath: 'parameters.jsCode',
+            patches: [{ find: 'return 1;', replace: 'globalThis.__syntaxGuardSentinel = true;\nreturn 1;' }]
+          }]
+        });
+
+        expect(result.success).toBe(true);
+        expect((globalThis as any).__syntaxGuardSentinel).toBeUndefined();
+      });
+
+      it('should reject patching valid code into an oversized unverifiable blob without parsing it', async () => {
+        const workflow = codeWorkflow('return 1;');
+        const oversized = 'const x = (;\n' + '// filler\n'.repeat(120_000);
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeName: 'Code',
+            fieldPath: 'parameters.jsCode',
+            // Over 1MB: never parsed (DoS protection), but a checkably-valid
+            // field must not silently become an unverifiable blob
+            patches: [{ find: 'return 1;', replace: oversized }]
+          }]
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.errors?.[0]?.message).toContain('could not verify');
+        expect(result.errors?.[0]?.message).toContain('updateNode');
+      });
+
+      it('should reject patching valid code into nesting the parser cannot check', async () => {
+        const workflow = codeWorkflow('return 1;');
+        const nested = 'return ' + '('.repeat(50_000) + '1' + ')'.repeat(50_000) + ';';
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeName: 'Code',
+            fieldPath: 'parameters.jsCode',
+            // Too deep for V8's parser stack: RangeError, not SyntaxError —
+            // uncheckable, and the baseline was checkably valid, so reject
+            patches: [{ find: 'return 1;', replace: nested }]
+          }]
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.errors?.[0]?.message).toContain('could not verify');
+      });
+
+      it('should let patches through when the baseline itself is unverifiable', async () => {
+        // An oversized field gives no standard to hold the patch to — the
+        // guard steps aside instead of trapping the field forever.
+        const oversized = 'const x = (;\n' + '// filler\n'.repeat(120_000);
+        const workflow = codeWorkflow(oversized);
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeName: 'Code',
+            fieldPath: 'parameters.jsCode',
+            patches: [{ find: 'const x = (;', replace: 'const y = (;' }]
+          }]
+        });
+
+        expect(result.success).toBe(true);
+      });
+
+      it('should reject a patch that strips an expression prefix leaving broken plain JS', async () => {
+        // The original runs as "{{ $json.code }}" after n8n's "=" strip —
+        // nested blocks, which parse — so the broken result is a regression.
+        const workflow = codeWorkflow('={{ $json.code }}');
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeName: 'Code',
+            fieldPath: 'parameters.jsCode',
+            patches: [{ find: '={{ $json.code }}', replace: 'return items.filter(;' }]
+          }]
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.errors?.[0]?.message).toContain('invalid JavaScript');
+      });
+
+      it('should guard functionCode fields on legacy Function nodes', async () => {
+        const workflow = JSON.parse(JSON.stringify(baseWorkflow));
+        workflow.nodes.push({
+          id: 'fn-1',
+          name: 'Function',
+          type: 'n8n-nodes-base.function',
+          typeVersion: 1,
+          position: [900, 300],
+          parameters: { functionCode: 'items[0].json.done = true;\nreturn items;' }
+        });
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeName: 'Function',
+            fieldPath: 'parameters.functionCode',
+            // Leaves an unterminated member expression
+            patches: [{ find: 'json.done = true;', replace: 'json.done = ;' }]
+          }]
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.errors?.[0]?.message).toContain('invalid JavaScript');
+      });
+
+      it('should let later operations proceed after a guard rejection in continueOnError mode', async () => {
+        const workflow = codeWorkflow('const x = 1;\nreturn x;');
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          continueOnError: true,
+          operations: [
+            {
+              type: 'patchNodeField' as const,
+              nodeName: 'Code',
+              fieldPath: 'parameters.jsCode',
+              patches: [{ find: 'return x;', replace: 'return x);' }]
+            },
+            { type: 'addTag' as const, tag: 'after-guard' }
+          ]
+        });
+
+        expect(result.failed).toContain(0);
+        expect(result.applied).toContain(1);
+        const codeNode = result.workflow!.nodes.find((n: any) => n.name === 'Code');
+        expect(codeNode?.parameters.jsCode).toBe('const x = 1;\nreturn x;');
+      });
+
+      it('should strip a leading = like n8n does and reject broken code behind it', async () => {
+        // jsCode is a noDataExpression field: n8n strips one leading "=" and
+        // runs the rest as code, so "=return (" is broken code, not an
+        // expression — the guard must not treat "=" as an exemption.
+        const workflow = codeWorkflow('return 1;');
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeName: 'Code',
+            fieldPath: 'parameters.jsCode',
+            patches: [{ find: 'return 1;', replace: '=return (' }]
+          }]
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.errors?.[0]?.message).toContain('invalid JavaScript');
+      });
+
+      it('should accept a valid =-prefixed value the way n8n will run it', async () => {
+        const workflow = codeWorkflow('return 1;');
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeName: 'Code',
+            fieldPath: 'parameters.jsCode',
+            // n8n runs this as "return 2;" after stripping the "="
+            patches: [{ find: 'return 1;', replace: '=return 2;' }]
+          }]
+        });
+
+        expect(result.success).toBe(true);
+      });
+
+      it('should not check pythonCode fields', async () => {
+        const workflow = JSON.parse(JSON.stringify(baseWorkflow));
+        workflow.nodes.push({
+          id: 'code-1',
+          name: 'Code',
+          type: 'n8n-nodes-base.code',
+          typeVersion: 2,
+          position: [900, 300],
+          parameters: { language: 'python', pythonCode: 'def pick(item):\n    return item' }
+        });
+
+        const result = await diffEngine.applyDiff(workflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeName: 'Code',
+            fieldPath: 'parameters.pythonCode',
+            patches: [{ find: 'return item', replace: 'return item.get("id")' }]
+          }]
+        });
+
+        expect(result.success).toBe(true);
+      });
+
+      it('should not check non-code string fields', async () => {
+        const result = await diffEngine.applyDiff(baseWorkflow, {
+          id: 'test',
+          operations: [{
+            type: 'patchNodeField' as const,
+            nodeId: 'http-1',
+            fieldPath: 'parameters.url',
+            // A URL is not JavaScript; the guard must not reject it
+            patches: [{ find: 'api.example.com', replace: 'api.example.com/v2(beta' }]
+          }]
+        });
+
+        expect(result.success).toBe(true);
+      });
     });
   });
 
@@ -2853,6 +3699,76 @@ describe('WorkflowDiffEngine', () => {
     });
   });
 
+  describe('MoveToFolder Operation', () => {
+    it('sets parentFolderId on the workflow for the PUT body', async () => {
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [{ type: 'moveToFolder', parentFolderId: 'folder-abc' } as any]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(true);
+      expect((result.workflow as any).parentFolderId).toBe('folder-abc');
+    });
+
+    it('maps null to a null parentFolderId (project root)', async () => {
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [{ type: 'moveToFolder', parentFolderId: null } as any]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(true);
+      expect((result.workflow as any).parentFolderId).toBeNull();
+    });
+
+    it('trims a padded folder ID', async () => {
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [{ type: 'moveToFolder', parentFolderId: '  folder-abc  ' } as any]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(true);
+      expect((result.workflow as any).parentFolderId).toBe('folder-abc');
+    });
+
+    it.each([
+      ['empty string', ''],
+      ['whitespace', '   '],
+      ['missing', undefined],
+      ['non-string', 42],
+    ])('rejects %s parentFolderId', async (_label, value) => {
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [{ type: 'moveToFolder', parentFolderId: value } as any]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('moveToFolder');
+      expect((result as any).workflow?.parentFolderId).toBeUndefined();
+    });
+
+    it('does not leak parentFolderId onto the workflow in validateOnly mode result', async () => {
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [{ type: 'moveToFolder', parentFolderId: 'folder-abc' } as any],
+        validateOnly: true
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(true);
+      // The input workflow object must stay untouched either way
+      expect((baseWorkflow as any).parentFolderId).toBeUndefined();
+    });
+  });
+
   describe('UpdateName Operation', () => {
     it('should update workflow name', async () => {
       const operation: UpdateNameOperation = {
@@ -2869,6 +3785,450 @@ describe('WorkflowDiffEngine', () => {
       
       expect(result.success).toBe(true);
       expect(result.workflow!.name).toBe('Updated Workflow Name');
+    });
+  });
+
+  describe('SetNodeGroups Operation', () => {
+    const grouped = (nodeIds: string[], name = 'Transform') => ({
+      id: 'g1',
+      name,
+      nodeIds
+    });
+
+    it('should create a group from node names and generate an id', async () => {
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'setNodeGroups',
+          nodeGroups: [{ name: 'Deliver', nodeNames: ['HTTP Request', 'Slack'] }]
+        } as any]
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.workflow!.nodeGroups).toHaveLength(1);
+      expect(result.workflow!.nodeGroups[0].name).toBe('Deliver');
+      expect(result.workflow!.nodeGroups[0].nodeIds).toEqual(['http-1', 'slack-1']);
+      expect(result.workflow!.nodeGroups[0].id).toMatch(/^[0-9a-f-]{36}$/);
+      // The caller needs these so a rejection of a group just authored is not swallowed.
+      expect(result.authoredGroupNames).toEqual(['Deliver']);
+    });
+
+    it('should accept node ids and a supplied group id', async () => {
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'setNodeGroups',
+          nodeGroups: [{ id: 'my-group', name: 'Deliver', nodeIds: ['http-1', 'slack-1'], description: 'sends it on' }]
+        } as any]
+      });
+
+      expect(result.workflow!.nodeGroups[0]).toEqual({
+        id: 'my-group',
+        name: 'Deliver',
+        nodeIds: ['http-1', 'slack-1'],
+        description: 'sends it on'
+      });
+    });
+
+    it('should replace the whole list, not merge into it', async () => {
+      const workflow = { ...baseWorkflow, nodeGroups: [grouped(['webhook-1'], 'Old')] } as any;
+
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'setNodeGroups',
+          nodeGroups: [{ name: 'New', nodeNames: ['HTTP Request'] }]
+        } as any]
+      });
+
+      expect(result.workflow!.nodeGroups.map((g: any) => g.name)).toEqual(['New']);
+    });
+
+    it('should ungroup everything for an empty array', async () => {
+      const workflow = { ...baseWorkflow, nodeGroups: [grouped(['http-1', 'slack-1'])] } as any;
+
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test-workflow',
+        operations: [{ type: 'setNodeGroups', nodeGroups: [] } as any]
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.workflow!.nodeGroups).toEqual([]);
+    });
+
+    it('should reject a missing payload rather than treat it as "ungroup everything"', async () => {
+      const workflow = { ...baseWorkflow, nodeGroups: [grouped(['http-1', 'slack-1'])] } as any;
+
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test-workflow',
+        operations: [{ type: 'setNodeGroups' } as any]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('requires a "nodeGroups" array');
+    });
+
+    it('should reject an unknown member', async () => {
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'setNodeGroups',
+          nodeGroups: [{ name: 'Deliver', nodeNames: ['No Such Node'] }]
+        } as any]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('No Such Node');
+    });
+
+    it('should not resolve a node id as a name (unlike node-targeting operations)', async () => {
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'setNodeGroups',
+          nodeGroups: [{ name: 'Deliver', nodeIds: ['Slack'] }]
+        } as any]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('references node ID "Slack"');
+    });
+
+    it('should reject a node claimed by two groups', async () => {
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'setNodeGroups',
+          nodeGroups: [
+            { name: 'First', nodeNames: ['HTTP Request'] },
+            { name: 'Second', nodeNames: ['HTTP Request', 'Slack'] }
+          ]
+        } as any]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('can only belong to one group');
+    });
+
+    it('should accept a node listed twice inside one group, and dedupe it', async () => {
+      // A duplicate within one group describes the same member set, so it is a typo rather than a
+      // conflict — unlike the same node appearing in two different groups.
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'setNodeGroups',
+          nodeGroups: [{ name: 'Deliver', nodeNames: ['HTTP Request', 'Slack', 'HTTP Request'] }]
+        } as any]
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.workflow!.nodeGroups[0].nodeIds).toEqual(['http-1', 'slack-1']);
+    });
+
+    it('should reject duplicate group names', async () => {
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'setNodeGroups',
+          nodeGroups: [
+            { name: 'Same', nodeNames: ['HTTP Request'] },
+            { name: 'Same', nodeNames: ['Slack'] }
+          ]
+        } as any]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('duplicate group name');
+    });
+
+    it('should resolve by name when nodeIds is present but empty', async () => {
+      // Regression: the validator chose the member list by non-emptiness and the resolver by mere
+      // presence, so `nodeIds: []` alongside a populated `nodeNames` validated, resolved to zero
+      // members, and — because setNodeGroups replaces the whole list — silently ungrouped the
+      // entire workflow while reporting success. Both keys with one empty is a common LLM shape.
+      const workflow = {
+        ...baseWorkflow,
+        nodeGroups: [{ id: 'existing', name: 'Existing', nodeIds: ['webhook-1'] }]
+      } as any;
+
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'setNodeGroups',
+          nodeGroups: [{ name: 'Deliver', nodeIds: [], nodeNames: ['HTTP Request', 'Slack'] }]
+        } as any]
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.workflow!.nodeGroups).toHaveLength(1);
+      expect(result.workflow!.nodeGroups[0].name).toBe('Deliver');
+      expect(result.workflow!.nodeGroups[0].nodeIds).toEqual(['http-1', 'slack-1']);
+      expect(result.warnings ?? []).toEqual([]);
+    });
+
+    it('should require exactly one of nodeNames or nodeIds', async () => {
+      const both = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'setNodeGroups',
+          nodeGroups: [{ name: 'Deliver', nodeNames: ['Slack'], nodeIds: ['slack-1'] }]
+        } as any]
+      });
+      expect(both.errors![0].message).toContain('use one or the other');
+
+      const neither = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{ type: 'setNodeGroups', nodeGroups: [{ name: 'Deliver' }] } as any]
+      });
+      expect(neither.errors![0].message).toContain('needs members');
+    });
+
+    it('should reject a non-string member with a message instead of crashing', async () => {
+      // This operation's payload is unvalidated at the tool boundary, so a non-string member used
+      // to reach normalizeNodeName() and throw a bare "trim is not a function".
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'setNodeGroups',
+          nodeGroups: [{ name: 'Deliver', nodeNames: ['Slack', 42] }]
+        } as any]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('not a node name');
+    });
+
+    it('should reject a member that is literally undefined', async () => {
+      // find() returns the element, so an `undefined` member would satisfy `badMember === undefined`
+      // and skip the guard written to catch it. Reachable in-process (mcp-engine), not over JSON.
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'setNodeGroups',
+          nodeGroups: [{ name: 'Deliver', nodeNames: ['Slack', undefined] }]
+        } as any]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('not a node name');
+      expect(result.errors![0].message).not.toContain('trim is not a function');
+    });
+
+    it('should reject a non-string group id', async () => {
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'setNodeGroups',
+          nodeGroups: [{ id: 7, name: 'Deliver', nodeNames: ['Slack'] }]
+        } as any]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('non-string "id"');
+    });
+
+    it('should reject a description longer than n8n allows', async () => {
+      // The create/update tools cap this in their schema; this operation must agree rather than
+      // let n8n answer with a 400.
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'setNodeGroups',
+          nodeGroups: [{ name: 'Deliver', nodeNames: ['Slack'], description: 'x'.repeat(156) }]
+        } as any]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('at most 155');
+    });
+
+    it('should reject a group without a usable name', async () => {
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'setNodeGroups',
+          nodeGroups: [{ name: '   ', nodeNames: ['Slack'] }]
+        } as any]
+      });
+
+      expect(result.errors![0].message).toContain('non-empty "name"');
+    });
+  });
+
+  describe('Canvas group reconciliation', () => {
+    const withGroup = (nodeIds: string[]) => ({
+      ...baseWorkflow,
+      nodeGroups: [{ id: 'g1', name: 'Transform', nodeIds }]
+    }) as any;
+
+    it('should prune a removed node from its group and keep the group', async () => {
+      const result = await diffEngine.applyDiff(withGroup(['http-1', 'slack-1']), {
+        id: 'test-workflow',
+        operations: [{ type: 'removeNode', nodeId: 'slack-1' }]
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.workflow!.nodeGroups).toEqual([{ id: 'g1', name: 'Transform', nodeIds: ['http-1'] }]);
+      expect(result.warnings!.some(w => w.message.includes('Transform'))).toBe(true);
+    });
+
+    it('should drop a group whose last member was removed', async () => {
+      const result = await diffEngine.applyDiff(withGroup(['slack-1']), {
+        id: 'test-workflow',
+        operations: [{ type: 'removeNode', nodeId: 'slack-1' }]
+      });
+
+      expect(result.workflow!.nodeGroups).toEqual([]);
+      expect(result.warnings!.some(w => w.message.includes('none of its nodes'))).toBe(true);
+    });
+
+    it('should keep membership when a node is removed and re-added with the same id in one batch', async () => {
+      // Reconciliation runs once at the end, so an intermediate state never loses the member.
+      const result = await diffEngine.applyDiff(withGroup(['http-1', 'slack-1']), {
+        id: 'test-workflow',
+        operations: [
+          { type: 'removeNode', nodeId: 'slack-1' },
+          {
+            type: 'addNode',
+            node: {
+              id: 'slack-1',
+              name: 'Slack',
+              type: 'n8n-nodes-base.slack',
+              typeVersion: 2.2,
+              position: [600, 300],
+              parameters: {}
+            }
+          }
+        ] as any
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.workflow!.nodeGroups[0].nodeIds).toEqual(['http-1', 'slack-1']);
+    });
+
+    it('should prune, not reject, when the same batch removes a node it just grouped', async () => {
+      // The client errors when a group the caller authored references a missing node, because that
+      // is a bad request. Inside one batch it is not: the caller asked for the removal. Pinning the
+      // difference so the two enforcement points stay deliberately, not accidentally, distinct.
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [
+          { type: 'setNodeGroups', nodeGroups: [{ name: 'Enrich', nodeNames: ['HTTP Request', 'Slack'] }] },
+          { type: 'removeNode', nodeId: 'slack-1' }
+        ] as any
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.workflow!.nodeGroups).toEqual([
+        { id: expect.any(String), name: 'Enrich', nodeIds: ['http-1'] }
+      ]);
+      expect(result.warnings!.some(w => w.message.includes('Enrich'))).toBe(true);
+      expect(result.errors ?? []).toEqual([]);
+    });
+
+    it('should leave groups untouched when a node is renamed (groups key on ids)', async () => {
+      const result = await diffEngine.applyDiff(withGroup(['http-1', 'slack-1']), {
+        id: 'test-workflow',
+        operations: [{ type: 'updateNode', nodeId: 'slack-1', updates: { name: 'Notify Team' } }]
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.workflow!.nodeGroups).toEqual([{ id: 'g1', name: 'Transform', nodeIds: ['http-1', 'slack-1'] }]);
+      expect(result.warnings ?? []).toEqual([]);
+    });
+
+    it('should leave a group that lost its shape for n8n to judge', async () => {
+      // Inserting a node between two members breaks single-entry/single-exit, but that rule is
+      // n8n's — the engine must not delete the group on a guess.
+      const result = await diffEngine.applyDiff(withGroup(['http-1', 'slack-1']), {
+        id: 'test-workflow',
+        operations: [
+          {
+            type: 'addNode',
+            node: {
+              id: 'mid-1',
+              name: 'Middle',
+              type: 'n8n-nodes-base.set',
+              typeVersion: 3.4,
+              position: [500, 300],
+              parameters: {}
+            }
+          },
+          { type: 'rewireConnection', source: 'HTTP Request', from: 'Slack', to: 'Middle' },
+          { type: 'addConnection', source: 'Middle', target: 'Slack' }
+        ] as any
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.workflow!.nodeGroups[0].nodeIds).toEqual(['http-1', 'slack-1']);
+    });
+
+    it('should refuse to patch a node id through patchNodeField', async () => {
+      // patchNodeField reaches arbitrary string fields by dot path, so it is a second door to the
+      // rewrite updateNode already refuses.
+      const result = await diffEngine.applyDiff(withGroup(['slack-1']), {
+        id: 'test-workflow',
+        operations: [{
+          type: 'patchNodeField',
+          nodeId: 'slack-1',
+          fieldPath: 'id',
+          patches: [{ find: 'slack-1', replace: 'new-id' }]
+        }] as any
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('node IDs are immutable');
+    });
+
+    it('should still allow patching a nested id inside node parameters', async () => {
+      // Only the node's own id is protected; ids inside parameters (e.g. Set assignments) are data.
+      const workflow = withGroup(['slack-1']);
+      const target = workflow.nodes.find((n: any) => n.id === 'http-1');
+      target.parameters = { assignments: { assignments: [{ id: 'old-assignment' }] } };
+
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'patchNodeField',
+          nodeId: 'http-1',
+          fieldPath: 'parameters.assignments.assignments.0.id',
+          patches: [{ find: 'old-assignment', replace: 'new-assignment' }]
+        }] as any
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    it('should refuse to change a node id, which would orphan group membership', async () => {
+      const result = await diffEngine.applyDiff(withGroup(['slack-1']), {
+        id: 'test-workflow',
+        operations: [{ type: 'updateNode', nodeId: 'slack-1', updates: { id: 'new-id' } }]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('node IDs are immutable');
+    });
+
+    it('should report reconciliation warnings in validateOnly mode too', async () => {
+      const result = await diffEngine.applyDiff(withGroup(['slack-1']), {
+        id: 'test-workflow',
+        operations: [{ type: 'removeNode', nodeId: 'slack-1' }],
+        validateOnly: true
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.warnings!.some(w => w.message.includes('Transform'))).toBe(true);
+    });
+
+    it('should leave a workflow without groups alone', async () => {
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{ type: 'removeNode', nodeId: 'slack-1' }]
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.workflow!.nodeGroups).toBeUndefined();
+      expect(result.authoredGroupNames).toBeUndefined();
     });
   });
 
@@ -6010,6 +7370,127 @@ describe('WorkflowDiffEngine', () => {
     });
   });
 
+  describe('undefined value property deletion (Issue #292)', () => {
+    // Mirrors the `null value property deletion` block. `undefined` is accepted
+    // as a deletion marker because workflow-auto-fixer.ts already uses
+    // `{prop: undefined}` to remove properties (see processErrorOutputFixes) —
+    // before this, those fixes set the property to `undefined` instead of
+    // deleting it, which left `hasOwnProperty(prop)` true and could trip
+    // validators that check property presence rather than value.
+
+    it('should delete a property when value is undefined', async () => {
+      const node = baseWorkflow.nodes.find((n: any) => n.name === 'HTTP Request')!;
+      (node as any).continueOnFail = true;
+
+      const operation: UpdateNodeOperation = {
+        type: 'updateNode',
+        nodeName: 'HTTP Request',
+        updates: { continueOnFail: undefined }
+      };
+
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [operation]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(true);
+      const updatedNode = result.workflow.nodes.find((n: any) => n.name === 'HTTP Request')!;
+      expect('continueOnFail' in updatedNode).toBe(false);
+    });
+
+    it('should delete a nested property when value is undefined', async () => {
+      const node = baseWorkflow.nodes.find((n: any) => n.name === 'HTTP Request')!;
+      (node as any).parameters = { url: 'https://example.com', authentication: 'basic' };
+
+      const operation: UpdateNodeOperation = {
+        type: 'updateNode',
+        nodeName: 'HTTP Request',
+        updates: { 'parameters.authentication': undefined }
+      };
+
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [operation]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(true);
+      const updatedNode = result.workflow.nodes.find((n: any) => n.name === 'HTTP Request')!;
+      expect((updatedNode as any).parameters.url).toBe('https://example.com');
+      expect('authentication' in (updatedNode as any).parameters).toBe(false);
+    });
+
+    it('should be a no-op when deleting a non-existent property with undefined', async () => {
+      const operation: UpdateNodeOperation = {
+        type: 'updateNode',
+        nodeName: 'HTTP Request',
+        updates: { nonExistentProp: undefined }
+      };
+
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [operation]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(true);
+      const updatedNode = result.workflow.nodes.find((n: any) => n.name === 'HTTP Request')!;
+      expect('nonExistentProp' in updatedNode).toBe(false);
+    });
+
+    it('should skip intermediate object creation when deleting from non-existent parent path with undefined', async () => {
+      const operation: UpdateNodeOperation = {
+        type: 'updateNode',
+        nodeName: 'HTTP Request',
+        updates: { 'nonExistent.deeply.nested.prop': undefined }
+      };
+
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [operation]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(true);
+      const updatedNode = result.workflow.nodes.find((n: any) => n.name === 'HTTP Request')!;
+      expect('nonExistent' in updatedNode).toBe(false);
+    });
+
+    it('should support continueOnFail → onError migration with undefined', async () => {
+      // Real-world case from Issue #292: replacing the deprecated continueOnFail
+      // with the modern onError property. Setting continueOnFail to undefined
+      // must remove it so the mutual-exclusivity validator does not trip.
+      const node = baseWorkflow.nodes.find((n: any) => n.name === 'HTTP Request')!;
+      (node as any).continueOnFail = true;
+
+      const operation: UpdateNodeOperation = {
+        type: 'updateNode',
+        nodeName: 'HTTP Request',
+        updates: {
+          continueOnFail: undefined,
+          onError: 'continueRegularOutput'
+        }
+      };
+
+      const request: WorkflowDiffRequest = {
+        id: 'test-workflow',
+        operations: [operation]
+      };
+
+      const result = await diffEngine.applyDiff(baseWorkflow, request);
+
+      expect(result.success).toBe(true);
+      const updatedNode = result.workflow.nodes.find((n: any) => n.name === 'HTTP Request')!;
+      expect('continueOnFail' in updatedNode).toBe(false);
+      expect((updatedNode as any).onError).toBe('continueRegularOutput');
+    });
+  });
+
   describe('transferWorkflow operation', () => {
     it('should set transferToProjectId in result for valid transferWorkflow', async () => {
       const operation: TransferWorkflowOperation = {
@@ -6154,6 +7635,509 @@ describe('WorkflowDiffEngine', () => {
       expect(result.errors![0].message).toContain('destinationProjectId');
       // In atomic mode, the workflow should not be returned since the batch failed
       expect(result.workflow).toBeUndefined();
+    });
+  });
+
+  describe('Bracket index paths (Issue #950)', () => {
+    const buildSetWorkflow = (): Workflow => {
+      const workflow = JSON.parse(JSON.stringify(baseWorkflow));
+      workflow.nodes.push({
+        id: 'set-1',
+        name: 'Set',
+        type: 'n8n-nodes-base.set',
+        typeVersion: 3.4,
+        position: [900, 300],
+        parameters: {
+          assignments: {
+            assignments: [
+              { id: 'a1', name: 'first', value: 'old value', type: 'string' },
+              { id: 'a2', name: 'second', value: 'untouched', type: 'string' }
+            ]
+          }
+        }
+      });
+      return workflow;
+    };
+
+    const findSetNode = (result: any) =>
+      result.workflow!.nodes.find((n: any) => n.name === 'Set');
+
+    it('should update an array element addressed with a bracket index', async () => {
+      const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+        id: 'test',
+        operations: [{
+          type: 'updateNode' as const,
+          nodeId: 'set-1',
+          updates: {
+            'parameters.assignments.assignments[0].value': 'new value'
+          }
+        }]
+      });
+
+      expect(result.success).toBe(true);
+      const assignments = findSetNode(result).parameters.assignments.assignments;
+      expect(assignments[0].value).toBe('new value');
+      expect(assignments[1].value).toBe('untouched');
+    });
+
+    it('should not create a literal bracket key on the array', async () => {
+      const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+        id: 'test',
+        operations: [{
+          type: 'updateNode' as const,
+          nodeId: 'set-1',
+          updates: {
+            'parameters.assignments.assignments[0].value': 'new value'
+          }
+        }]
+      });
+
+      expect(result.success).toBe(true);
+      const container = findSetNode(result).parameters.assignments;
+      expect(Object.prototype.hasOwnProperty.call(container, 'assignments[0]')).toBe(false);
+      expect(container.assignments.length).toBe(2);
+    });
+
+    it('should update through multiple bracket indices', async () => {
+      const workflow = JSON.parse(JSON.stringify(baseWorkflow));
+      workflow.nodes.push({
+        id: 'matrix-1',
+        name: 'Matrix',
+        type: 'n8n-nodes-base.code',
+        typeVersion: 2,
+        position: [900, 300],
+        parameters: { rows: [[{ label: 'a' }, { label: 'b' }]] }
+      });
+
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test',
+        operations: [{
+          type: 'updateNode' as const,
+          nodeId: 'matrix-1',
+          updates: { 'parameters.rows[0][1].label': 'c' }
+        }]
+      });
+
+      expect(result.success).toBe(true);
+      const rows = result.workflow!.nodes.find((n: any) => n.id === 'matrix-1')!.parameters.rows as any;
+      expect(rows[0][1].label).toBe('c');
+      expect(rows[0][0].label).toBe('a');
+    });
+
+    it('should still support the numeric dot notation form', async () => {
+      const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+        id: 'test',
+        operations: [{
+          type: 'updateNode' as const,
+          nodeId: 'set-1',
+          updates: {
+            'parameters.assignments.assignments.0.value': 'dotted value'
+          }
+        }]
+      });
+
+      expect(result.success).toBe(true);
+      expect(findSetNode(result).parameters.assignments.assignments[0].value).toBe('dotted value');
+    });
+
+    it('should remove an array element without leaving a hole', async () => {
+      const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+        id: 'test',
+        operations: [{
+          type: 'updateNode' as const,
+          nodeId: 'set-1',
+          updates: { 'parameters.assignments.assignments[0]': null }
+        }]
+      });
+
+      expect(result.success).toBe(true);
+      const assignments = findSetNode(result).parameters.assignments.assignments;
+      expect(assignments).toHaveLength(1);
+      expect(assignments[0].name).toBe('second');
+    });
+
+    it('should reject a malformed bracket index', async () => {
+      for (const path of [
+        'parameters.assignments.assignments[x].value',
+        'parameters.assignments.assignments[].value',
+        'parameters.assignments.assignments[0.value',
+        'parameters.assignments.assignments[-1].value'
+      ]) {
+        const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+          id: 'test',
+          operations: [{
+            type: 'updateNode' as const,
+            nodeId: 'set-1',
+            updates: { [path]: 'new value' }
+          }]
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.errors![0].message).toContain('malformed bracket index');
+      }
+    });
+
+    it('should reject an out-of-range bracket index instead of writing a junk key', async () => {
+      const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+        id: 'test',
+        operations: [{
+          type: 'updateNode' as const,
+          nodeId: 'set-1',
+          updates: { 'parameters.assignments.assignments[5].value': 'new value' }
+        }]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('out of range');
+    });
+
+    it('should reject a bracket index applied to a non-array value', async () => {
+      const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+        id: 'test',
+        operations: [{
+          type: 'updateNode' as const,
+          nodeId: 'set-1',
+          updates: { 'parameters.assignments[0].value': 'new value' }
+        }]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('expects an array');
+    });
+
+    it('should reject a forbidden key that follows a bracket index', async () => {
+      const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+        id: 'test',
+        operations: [{
+          type: 'updateNode' as const,
+          nodeId: 'set-1',
+          updates: { 'parameters.assignments.assignments[0].__proto__.polluted': 'malicious' }
+        }]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('forbidden key');
+      expect(({} as any).polluted).toBeUndefined();
+    });
+
+    it('should patch a string field addressed with a bracket index', async () => {
+      const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+        id: 'test',
+        operations: [{
+          type: 'patchNodeField' as const,
+          nodeId: 'set-1',
+          fieldPath: 'parameters.assignments.assignments[0].value',
+          patches: [{ find: 'old', replace: 'new' }]
+        }]
+      });
+
+      expect(result.success).toBe(true);
+      const container = findSetNode(result).parameters.assignments;
+      expect(container.assignments[0].value).toBe('new value');
+      expect(Object.prototype.hasOwnProperty.call(container, 'assignments[0]')).toBe(false);
+    });
+
+    it('should report a malformed bracket path in patchNodeField', async () => {
+      const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+        id: 'test',
+        operations: [{
+          type: 'patchNodeField' as const,
+          nodeId: 'set-1',
+          fieldPath: 'parameters.assignments.assignments[x].value',
+          patches: [{ find: 'old', replace: 'new' }]
+        }]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('malformed bracket index');
+    });
+
+    it('should report an out-of-range bracket path in patchNodeField', async () => {
+      const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+        id: 'test',
+        operations: [{
+          type: 'patchNodeField' as const,
+          nodeId: 'set-1',
+          fieldPath: 'parameters.assignments.assignments[5].value',
+          patches: [{ find: 'old', replace: 'new' }]
+        }]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('does not exist');
+    });
+
+    it('should reject an index equal to the array length', async () => {
+      const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+        id: 'test',
+        operations: [{
+          type: 'updateNode' as const,
+          nodeId: 'set-1',
+          updates: { 'parameters.assignments.assignments[2].value': 'appended' }
+        }]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('out of range');
+    });
+
+    it('should apply __patch_find_replace through a bracket path', async () => {
+      const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+        id: 'test',
+        operations: [{
+          type: 'updateNode' as const,
+          nodeId: 'set-1',
+          updates: {
+            'parameters.assignments.assignments[0].value': {
+              __patch_find_replace: [{ find: 'old', replace: 'new' }]
+            }
+          }
+        }]
+      });
+
+      expect(result.success).toBe(true);
+      const container = findSetNode(result).parameters.assignments;
+      expect(container.assignments[0].value).toBe('new value');
+      expect(Object.prototype.hasOwnProperty.call(container, 'assignments[0]')).toBe(false);
+    });
+
+    it('should reject empty path segments', async () => {
+      for (const path of [
+        'parameters..url',
+        'parameters.',
+        '.parameters',
+        ''
+      ]) {
+        const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+          id: 'test',
+          operations: [{
+            type: 'updateNode' as const,
+            nodeId: 'set-1',
+            updates: { [path]: 'new value' }
+          }]
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.errors![0].message).toContain('empty path segment');
+      }
+    });
+
+    it('should reject an empty path segment in patchNodeField', async () => {
+      const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+        id: 'test',
+        operations: [{
+          type: 'patchNodeField' as const,
+          nodeId: 'set-1',
+          fieldPath: 'parameters..assignments',
+          patches: [{ find: 'old', replace: 'new' }]
+        }]
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('empty path segment');
+    });
+
+    it('should reject a non-numeric dot segment applied to an array', async () => {
+      for (const path of [
+        'parameters.assignments.assignments.-1.value',
+        'parameters.assignments.assignments.length'
+      ]) {
+        const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+          id: 'test',
+          operations: [{
+            type: 'updateNode' as const,
+            nodeId: 'set-1',
+            updates: { [path]: 0 }
+          }]
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.errors![0].message).toContain('is not an array index');
+      }
+    });
+
+    it('should remove several elements of the same array in one updates object', async () => {
+      const workflow = JSON.parse(JSON.stringify(baseWorkflow));
+      workflow.nodes.push({
+        id: 'list-1',
+        name: 'List',
+        type: 'n8n-nodes-base.code',
+        typeVersion: 2,
+        position: [900, 300],
+        parameters: { items: [{ label: 'A' }, { label: 'B' }, { label: 'C' }] }
+      });
+
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test',
+        operations: [{
+          type: 'updateNode' as const,
+          nodeId: 'list-1',
+          updates: {
+            'parameters.items[0]': null,
+            'parameters.items[1]': null
+          }
+        }]
+      });
+
+      expect(result.success).toBe(true);
+      const items = result.workflow!.nodes.find((n: any) => n.id === 'list-1')!.parameters.items as any;
+      expect(items).toEqual([{ label: 'C' }]);
+    });
+
+    describe('atomic updates', () => {
+      it('should leave the node untouched when a later update path fails', async () => {
+        const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+          id: 'test',
+          operations: [{
+            type: 'updateNode' as const,
+            nodeId: 'set-1',
+            updates: {
+              'parameters.mode': 'manual',
+              'parameters.created[0].value': 'never applied'
+            }
+          }]
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.errors![0].message).toContain('expects an array');
+      });
+
+      it('should not leave remnants of a failed updates object under continueOnError', async () => {
+        const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+          id: 'test',
+          continueOnError: true,
+          operations: [
+            {
+              type: 'updateNode' as const,
+              nodeId: 'set-1',
+              updates: {
+                'parameters.mode': 'manual',
+                'parameters.created[0].value': 'never applied'
+              }
+            },
+            {
+              type: 'updateNode' as const,
+              nodeId: 'set-1',
+              updates: { 'parameters.assignments.assignments[1].value': 'applied' }
+            }
+          ]
+        });
+
+        expect(result.applied).toEqual([1]);
+        expect(result.failed).toEqual([0]);
+        const setNode = findSetNode(result);
+        expect(setNode.parameters.created).toBeUndefined();
+        expect(setNode.parameters.mode).toBeUndefined();
+        expect(setNode.parameters.assignments.assignments[1].value).toBe('applied');
+      });
+
+      it('should not apply earlier keys when a later key is out of range', async () => {
+        const result = await diffEngine.applyDiff(buildSetWorkflow(), {
+          id: 'test',
+          continueOnError: true,
+          operations: [{
+            type: 'updateNode' as const,
+            nodeId: 'set-1',
+            updates: {
+              'parameters.mode': 'manual',
+              'parameters.assignments.assignments[9].value': 'never applied'
+            }
+          }]
+        });
+
+        expect(result.failed).toEqual([0]);
+        const setNode = findSetNode(result);
+        expect(setNode.parameters.mode).toBeUndefined();
+        expect(setNode.parameters.assignments.assignments).toHaveLength(2);
+      });
+    });
+  });
+  // n8n represents an output with nothing wired to it as a null branch and its API stores one
+  // verbatim, so any workflow read back can carry one (#1096). Every walk below used to reach
+  // `null.filter` or `null.length` and surface a TypeError as an internal error.
+  describe('null output branches', () => {
+    const withNullBranch = (main: any[]): Workflow => {
+      const workflow = builder.build() as Workflow;
+      workflow.connections['Webhook'] = { main } as any;
+      return workflow;
+    };
+
+    it('keeps an intermediate null branch while cleanStaleConnections strips stale targets', async () => {
+      const workflow = withNullBranch([
+        null,
+        [
+          { node: 'HTTP Request', type: 'main', index: 0 },
+          { node: 'NonExistentNode', type: 'main', index: 0 },
+        ],
+      ]);
+
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test-workflow',
+        operations: [{ type: 'cleanStaleConnections' } as CleanStaleConnectionsOperation],
+      });
+
+      expect(result.success).toBe(true);
+      const main = result.workflow!.connections['Webhook']['main'];
+      expect(main[0]).toBeNull();
+      expect(main[1]).toHaveLength(1);
+      expect(main[1]![0].node).toBe('HTTP Request');
+    });
+
+    it('removes a connection from a workflow that carries a null branch', async () => {
+      const workflow = withNullBranch([[{ node: 'HTTP Request', type: 'main', index: 0 }], null]);
+
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test-workflow',
+        operations: [
+          { type: 'removeConnection', source: 'Webhook', target: 'HTTP Request' } as RemoveConnectionOperation,
+        ],
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.workflow!.connections['Webhook']?.['main']).toBeUndefined();
+    });
+
+    it('removes a node referenced alongside a null branch', async () => {
+      const workflow = withNullBranch([null, [{ node: 'HTTP Request', type: 'main', index: 0 }]]);
+
+      const result = await diffEngine.applyDiff(workflow, {
+        id: 'test-workflow',
+        operations: [{ type: 'removeNode', nodeName: 'HTTP Request' } as RemoveNodeOperation],
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.workflow!.nodes.find((n: any) => n.name === 'HTTP Request')).toBeUndefined();
+    });
+
+    it('accepts a null branch in a replaceConnections payload', async () => {
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        // Typed, not cast: a null branch has to be expressible through
+        // ReplaceConnectionsOperation, or a TypeScript caller cannot send back a shape it
+        // read from n8n (#1096).
+        operations: [{
+          type: 'replaceConnections',
+          connections: {
+            Webhook: { main: [[{ node: 'HTTP Request', type: 'main', index: 0 }], null] },
+          },
+        } satisfies ReplaceConnectionsOperation],
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.workflow!.connections['Webhook']['main'][1]).toBeNull();
+    });
+
+    it('still rejects a non-null, non-array branch in a replaceConnections payload', async () => {
+      const result = await diffEngine.applyDiff(baseWorkflow, {
+        id: 'test-workflow',
+        operations: [{
+          type: 'replaceConnections',
+          connections: { Webhook: { main: ['nope'] } },
+        } as unknown as WorkflowDiffOperation],
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errors![0].message).toContain('must contain arrays of connections');
     });
   });
 });

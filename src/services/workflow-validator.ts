@@ -5,7 +5,7 @@
 
 import crypto from 'crypto';
 import { NodeRepository } from '../database/node-repository';
-import { EnhancedConfigValidator } from './enhanced-config-validator';
+import { EnhancedConfigValidator, type ValidationProfile } from './enhanced-config-validator';
 import { ExpressionValidator } from './expression-validator';
 import { extractBracketExpressions } from '../utils/expression-utils';
 import { ExpressionFormatValidator } from './expression-format-validator';
@@ -18,8 +18,18 @@ import { isAIToolSubNode } from './ai-tool-validators';
 import { isTriggerNode } from '../utils/node-type-utils';
 import { isNonExecutableNode } from '../utils/node-classification';
 import { validateConditionNodeStructure } from './n8n-validation';
+import { checkNodeGroups } from './node-groups';
 import { ToolVariantGenerator } from './tool-variant-generator';
+import { isDeprecatedNodeVersion, deprecatedNodeMessage, deprecatedNodeReplacementHint } from './deprecated-nodes';
+import { findNativeAlternative } from './code-native-alternatives';
 const logger = new Logger({ prefix: '[WorkflowValidator]' });
+
+/**
+ * The workflow-level "add error handling" advisory. checkWorkflowPatterns emits
+ * it (advisory profiles) and generateSuggestions dedupes against it, so both
+ * must reference the same literal.
+ */
+const ADD_ERROR_HANDLING_ADVISORY = 'Consider adding error handling to your workflow';
 
 /**
  * All valid connection output keys in n8n workflows.
@@ -35,6 +45,17 @@ export const VALID_CONNECTION_TYPES = new Set<string>([
   'ai_retriever',
   'ai_reranker',
 ]);
+
+/**
+ * Credential types any HTTP API can use (httpHeaderAuth, httpMultipleHeadersAuth,
+ * oAuth2Api, ...); they say nothing about a native node.
+ */
+function isGenericCredentialType(type: string): boolean {
+  return type.startsWith('http') || ['oAuth1Api', 'oAuth2Api', 'jwtAuth'].includes(type);
+}
+
+/** Credential type -> native node names, computed once per repository. */
+const ACTION_NODES_BY_CREDENTIAL = new WeakMap<object, Map<string, string[]>>();
 
 interface WorkflowNode {
   id: string;
@@ -56,9 +77,13 @@ interface WorkflowNode {
   executeOnce?: boolean;
 }
 
+// A null branch is n8n's own "nothing wired to this output" and reaches here from any workflow
+// read back out of n8n (#1096); collectMalformedConnectionErrors allows it.
+type ConnectionBranch = Array<{ node: string; type: string; index: number }> | null;
+
 interface WorkflowConnection {
   [sourceNode: string]: {
-    [outputType: string]: Array<Array<{ node: string; type: string; index: number }>>;
+    [outputType: string]: ConnectionBranch[];
   };
 }
 
@@ -66,6 +91,7 @@ interface WorkflowJson {
   name?: string;
   nodes: WorkflowNode[];
   connections: WorkflowConnection;
+  nodeGroups?: Array<{ id: string; name: string; nodeIds: string[]; description?: string }>;
   settings?: any;
   staticData?: any;
   pinData?: any;
@@ -102,8 +128,167 @@ export interface WorkflowValidationResult {
   suggestions: string[];
 }
 
+function describeValueType(value: unknown): string {
+  if (value === null) return 'null';
+  if (value === undefined) return 'nothing';
+  if (Array.isArray(value)) return 'an array';
+  return typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Every pass below reads nodes without checking their shape: `isNonExecutableNode(n.type)`
+ * lowercases the type, `NodeTypeNormalizer` calls `.replace` on it, and the expression checks
+ * walk `parameters`. A malformed entry therefore throws several passes in, and because the
+ * whole run is wrapped in one try/catch the caller gets that TypeError as the only error with
+ * every other check skipped - the same non-actionable failure #1071 reported for the create
+ * path. Report what cannot be inspected instead, before anything inspects it.
+ *
+ * Deliberately narrower than n8n's node schema: this tool validates drafts, so a node with no
+ * `id`, `name` or `typeVersion` must still get its real feedback from the passes below.
+ */
+function collectMalformedNodeErrors(nodes: unknown[]): string[] {
+  const errors: string[] = [];
+
+  nodes.forEach((node, index) => {
+    if (!isPlainObject(node)) {
+      errors.push(`Node at index ${index} is not an object (received ${describeValueType(node)}). Each entry in "nodes" must be a node object.`);
+      return;
+    }
+
+    const label = typeof node.name === 'string' ? `"${node.name}"` : `at index ${index}`;
+
+    if (typeof node.type !== 'string') {
+      errors.push(`Node ${label} has a non-string "type" (received ${describeValueType(node.type)}). Node types are strings such as "n8n-nodes-base.webhook".`);
+    }
+
+    // An absent name is allowed - a draft may not have named the node yet - but a name that is
+    // present has to be a string. An object one throws outright, because the structure checks
+    // index `connections[node.name]` and coercing an object key raises "Cannot convert object
+    // to primitive value"; null, numbers and booleans coerce quietly instead, which is worse,
+    // because the node then silently fails to match any connection.
+    if ('name' in node && typeof node.name !== 'string') {
+      errors.push(`Node at index ${index} has a non-string "name" (received ${describeValueType(node.name)}). Connections reference nodes by name, so names must be strings.`);
+    }
+
+    if (!('parameters' in node)) {
+      errors.push(`Node ${label} has no "parameters". Use an empty object if the node takes no parameters.`);
+    } else if (node.parameters == null) {
+      // Both nullish values are rejected: they are what the AI-node checks dereference
+      // (`node.parameters.hasOutputParser`, `needsFallback`). Other non-object values are wrong
+      // too but do not throw, and rejecting them would newly fail clients that send
+      // `parameters` serialized - see #1094.
+      errors.push(`Node ${label} has ${node.parameters === null ? 'null' : 'undefined'} "parameters". Use an empty object if the node takes no parameters.`);
+    }
+  });
+
+  return errors;
+}
+
+/**
+ * The connection half of the gate above, for the same reason (#1094). The passes that walk
+ * `connections` read the shape without checking it: `validateConnections` calls `Object.entries`
+ * on every source entry, `validateConnectionOutputs` calls `.forEach` on every branch and reads
+ * `.index` off every connection, and expression checking reaches `nodeHasInput` even when
+ * connection validation is switched off. The shapes that happen not to throw are no better: a
+ * local `!Array.isArray` guard skips a null branch in silence, so the caller is told nothing
+ * about a connection n8n will reject.
+ *
+ * Shallower than the write schema in n8n-validation.ts on purpose - connection entries with no
+ * `type` or `index` validate here today, and this tool validates drafts.
+ */
+function collectMalformedConnectionErrors(connections: Record<string, unknown>): string[] {
+  const errors: string[] = [];
+
+  for (const [sourceName, outputs] of Object.entries(connections)) {
+    if (!isPlainObject(outputs)) {
+      errors.push(`Connections for "${sourceName}" must be an object keyed by connection type (received ${describeValueType(outputs)}). Example: {"main": [[{"node": "Next Node", "type": "main", "index": 0}]]}.`);
+      continue;
+    }
+
+    for (const [outputKey, branches] of Object.entries(outputs)) {
+      // Collected per key so an unknown key can be reported ahead of them - see below.
+      const keyErrors: string[] = [];
+
+      // Reported even though nothing dereferences it today. n8n's own type admits no null here
+      // - `INodeConnections` is `{[key: string]: NodeInputConnections}` and that alias is an
+      // array - so staying silent tells the caller a workflow n8n will refuse is fine. None of
+      // the 2,352 bundled templates carries the shape either.
+      if (!Array.isArray(branches)) {
+        keyErrors.push(`Connections for "${sourceName}" output "${outputKey}" must be an array of output branches (received ${describeValueType(branches)}). One branch per output: [[{"node": "Next Node", "type": "main", "index": 0}]].`);
+      }
+
+      for (const [branchIndex, branch] of (Array.isArray(branches) ? branches : []).entries()) {
+        const branchLabel = `"${sourceName}".${outputKey}[${branchIndex}]`;
+
+        // A nullish branch is tolerated, as it is today, and n8n's type says so outright:
+        // `NodeInputConnections = Array<IConnection[] | null>`. Every other non-array shape
+        // does get dereferenced.
+        if (branch === null || branch === undefined) {
+          continue;
+        }
+
+        if (!Array.isArray(branch)) {
+          keyErrors.push(`Output branch ${branchLabel} must be an array of connections (received ${describeValueType(branch)}). Each branch holds a list: [{"node": "Next Node", "type": "main", "index": 0}], or [] when nothing is connected.`);
+          continue;
+        }
+
+        for (const [connectionIndex, connection] of branch.entries()) {
+          const label = `Connection ${branchLabel}[${connectionIndex}]`;
+
+          if (!isPlainObject(connection)) {
+            keyErrors.push(`${label} must be an object (received ${describeValueType(connection)}), naming its target: {"node": "Next Node", "type": "main", "index": 0}.`);
+            continue;
+          }
+
+          if (typeof connection.node !== 'string') {
+            keyErrors.push(`${label} has a non-string "node" (received ${describeValueType(connection.node)}). Connections reference their target node by name.`);
+          }
+
+          // `type` and `index` reach code that coerces them - `connection.index < 0`, and the
+          // invalid-type message interpolates the type - and JSON can express an object that
+          // throws "Cannot convert object to primitive value" when coerced. Scalars of the
+          // wrong kind are left to the connection pass, which already reports them.
+          if (connection.type !== null && typeof connection.type === 'object') {
+            keyErrors.push(`${label} has a non-string "type" (received ${describeValueType(connection.type)}). Connection types are strings such as "main".`);
+          }
+
+          if (connection.index !== null && typeof connection.index === 'object') {
+            keyErrors.push(`${label} has a non-numeric "index" (received ${describeValueType(connection.index)}). Output indices are numbers, such as 0.`);
+          }
+        }
+      }
+
+      if (keyErrors.length === 0) continue;
+
+      // Telling the caller how to nest a branch under a key that is not a connection type sends
+      // them to fix the wrong thing - bundled template 6686 keys its connections under "output"
+      // with flattened branches, and needs both. validateConnections reports the key itself, but
+      // the errors collected here are what stop it running, so name it here too.
+      if (!VALID_CONNECTION_TYPES.has(outputKey)) {
+        errors.push(`Unknown connection output key "${outputKey}" on node "${sourceName}". Valid keys are: ${[...VALID_CONNECTION_TYPES].join(', ')}.`);
+      }
+
+      errors.push(...keyErrors);
+    }
+  }
+
+  return errors;
+}
+
+// Total connection steps the SplitInBatches loop-back checks may walk in one validation
+const MAX_LOOP_BACK_STEPS = 1_000_000;
+
 export class WorkflowValidator {
   private currentWorkflow: WorkflowJson | null = null;
+  private loopBackReach = new Map<string, { reached: Set<string>; complete: boolean }>();
+  private loopBackSteps = 0;
+  private loopBackIncompleteReported = false;
+  private lowerCaseNames = new Map<WorkflowNode, { type: string; name: string }>();
+  private mainInputTargets: { workflow: WorkflowJson; targets: Set<string> } | null = null;
   private similarityService: NodeSimilarityService;
 
   constructor(
@@ -130,6 +315,11 @@ export class WorkflowValidator {
   ): Promise<WorkflowValidationResult> {
     // Store current workflow for access in helper methods
     this.currentWorkflow = workflow;
+    this.loopBackReach = new Map();
+    this.loopBackSteps = MAX_LOOP_BACK_STEPS;
+    this.loopBackIncompleteReported = false;
+    this.lowerCaseNames = new Map();
+    this.mainInputTargets = null;
 
     const {
       validateNodes = true,
@@ -164,6 +354,18 @@ export class WorkflowValidator {
         return result;
       }
 
+      // Shape check before anything reads a node - see collectMalformedNodeErrors.
+      if (Array.isArray(workflow.nodes)) {
+        const malformedNodeErrors = collectMalformedNodeErrors(workflow.nodes);
+        if (malformedNodeErrors.length > 0) {
+          for (const message of malformedNodeErrors) {
+            result.errors.push({ type: 'error', message });
+          }
+          result.valid = false;
+          return result;
+        }
+      }
+
       // Update statistics after null check (exclude sticky notes from counts)
       const executableNodes = Array.isArray(workflow.nodes) ? workflow.nodes.filter(n => !isNonExecutableNode(n.type)) : [];
       result.statistics.totalNodes = executableNodes.length;
@@ -174,51 +376,56 @@ export class WorkflowValidator {
 
       // Only continue if basic structure is valid
       if (workflow.nodes && Array.isArray(workflow.nodes) && workflow.connections && typeof workflow.connections === 'object') {
+        // Shape check before any pass walks a connection - see collectMalformedConnectionErrors.
+        const malformedConnectionErrors = collectMalformedConnectionErrors(workflow.connections);
+        for (const message of malformedConnectionErrors) {
+          result.errors.push({ type: 'error', message, code: 'MALFORMED_CONNECTION' });
+        }
+
         // Validate each node if requested
         if (validateNodes && workflow.nodes.length > 0) {
           await this.validateAllNodes(workflow, result, profile);
         }
 
-        // Validate connections if requested
-        if (validateConnections) {
-          this.validateConnections(workflow, result, profile);
-        }
+        // Canvas groups (n8n 2.28+). Reference-level checks only — whether the members form a
+        // groupable shape is decided by n8n on write, and it names the group it rejects.
+        this.validateNodeGroups(workflow, result);
 
-        // Validate expressions if requested
-        if (validateExpressions && workflow.nodes.length > 0) {
-          this.validateExpressions(workflow, result, profile);
-        }
-
-        // Check workflow patterns and best practices
-        if (workflow.nodes.length > 0) {
-          this.checkWorkflowPatterns(workflow, result, profile);
-        }
-
-        // Validate AI-specific nodes (AI Agent, Chat Trigger, AI tools)
-        if (workflow.nodes.length > 0 && hasAINodes(workflow)) {
-          const aiIssues = validateAISpecificNodes(workflow);
-          // Convert AI validation issues to workflow validation format
-          for (const issue of aiIssues) {
-            const validationIssue: ValidationIssue = {
-              type: issue.severity === 'error' ? 'error' : 'warning',
-              nodeId: issue.nodeId,
-              nodeName: issue.nodeName,
-              message: issue.message,
-              details: issue.code ? { code: issue.code } : undefined
-            };
-
-            if (issue.severity === 'error') {
-              result.errors.push(validationIssue);
-            } else {
-              result.warnings.push(validationIssue);
-            }
+        // Every pass below reads `connections`, so a malformed one leaves them either throwing
+        // or describing a graph the workflow does not have. They sit out while the shape errors
+        // stand; the node and group findings above do not read connections and are kept.
+        // `validateConnections: false` does not make the gate optional - checkWorkflowPatterns
+        // runs whatever that option says, and reaches workflowHasErrorHandling, which reads
+        // `connections[name]?.main`.
+        if (malformedConnectionErrors.length === 0) {
+          // Validate connections if requested
+          if (validateConnections) {
+            this.validateConnections(workflow, result, profile);
           }
+
+          // Validate expressions if requested
+          if (validateExpressions && workflow.nodes.length > 0) {
+            this.validateExpressions(workflow, result, profile);
+          }
+
+          // Check workflow patterns and best practices
+          if (workflow.nodes.length > 0) {
+            this.checkWorkflowPatterns(workflow, result, profile);
+          }
+
+          // Validate AI-specific nodes (AI Agent, Chat Trigger, AI tools)
+          if (workflow.nodes.length > 0 && hasAINodes(workflow)) {
+            this.validateAINodes(workflow, result);
+          }
+
+          // Add suggestions based on findings
+          this.generateSuggestions(workflow, result, profile);
         }
 
-        // Add suggestions based on findings
-        this.generateSuggestions(workflow, result);
-
-        // Add AI-specific recovery suggestions if there are errors
+        // Recovery hints only read the error messages collected above, never the workflow, so
+        // they are still offered when the connection shape stopped the passes in between - and
+        // the hint a connection error triggers spells out the [[{node, type, index}]] nesting,
+        // which is the fix for the shape errors this gate reports.
         if (result.errors.length > 0) {
           this.addErrorRecoverySuggestions(result);
         }
@@ -234,6 +441,74 @@ export class WorkflowValidator {
 
     result.valid = result.errors.length === 0;
     return result;
+  }
+
+  /**
+   * Report AI-node problems in workflow validation format.
+   *
+   * info-severity issues are advisories, not defects — route them to the suggestions channel
+   * instead of upgrading them to warnings.
+   */
+  private validateAINodes(workflow: WorkflowJson, result: WorkflowValidationResult): void {
+    for (const issue of validateAISpecificNodes(workflow)) {
+      if (issue.severity === 'info') {
+        result.suggestions.push(issue.message);
+        continue;
+      }
+
+      const validationIssue: ValidationIssue = {
+        type: issue.severity === 'error' ? 'error' : 'warning',
+        nodeId: issue.nodeId,
+        nodeName: issue.nodeName,
+        message: issue.message,
+        details: issue.code ? { code: issue.code } : undefined
+      };
+
+      if (issue.severity === 'error') {
+        result.errors.push(validationIssue);
+      } else {
+        result.warnings.push(validationIssue);
+      }
+    }
+  }
+
+  /**
+   * Report canvas-group problems n8n would reject on write.
+   *
+   * Always warnings, never errors: a frame is presentation, and n8n-mcp repairs or ungroups what
+   * the server refuses rather than blocking the write. Trigger membership uses node-type metadata
+   * from the database, because a type's name does not reliably say whether it is a trigger.
+   */
+  private validateNodeGroups(workflow: WorkflowJson, result: WorkflowValidationResult): void {
+    if (!Array.isArray(workflow.nodeGroups) || workflow.nodeGroups.length === 0) return;
+
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): one lookup per node type
+    const triggerByType = new Map<string, boolean>();
+    const issues = checkNodeGroups(
+      { nodes: workflow.nodes as any, nodeGroups: workflow.nodeGroups },
+      {
+        isTrigger: node => {
+          let trigger = triggerByType.get(node.type);
+          if (trigger === undefined) {
+            const nodeInfo = this.nodeRepository.getNode(
+              NodeTypeNormalizer.normalizeToFullForm(node.type)
+            );
+            trigger = nodeInfo ? Boolean(nodeInfo.isTrigger) : isTriggerNode(node.type);
+            triggerByType.set(node.type, trigger);
+          }
+          return trigger;
+        }
+      }
+    );
+
+    for (const issue of issues) {
+      result.warnings.push({
+        type: 'warning',
+        code: issue.code,
+        message: issue.message,
+        details: { group: issue.group }
+      });
+    }
   }
 
   /**
@@ -310,7 +585,15 @@ export class WorkflowValidator {
     // Check for empty connections in multi-node workflows
     if (workflow.nodes.length > 1) {
       const hasEnabledNodes = workflow.nodes.some(n => !n.disabled);
-      const hasConnections = Object.keys(workflow.connections).length > 0;
+      // A key with empty branches (`main: [[]]`, `main: [null]`) is not a connection (#1101).
+      // A malformed output value counts, so its shape error speaks instead of this one.
+      const hasConnections = Object.values(workflow.connections).some(outputs =>
+        Object.values(outputs || {}).some(branches =>
+          !Array.isArray(branches) || branches.some(branch => !Array.isArray(branch)
+            ? branch != null
+            : branch.some(target => typeof target?.node === 'string' && target.node.length > 0))
+        )
+      );
       
       if (hasEnabledNodes && !hasConnections) {
         result.errors.push({
@@ -338,7 +621,9 @@ export class WorkflowValidator {
       }
       nodeNames.add(node.name);
 
-      if (nodeIds.has(node.id)) {
+      // Missing/empty ids never collide: n8n keys nodes by name and
+      // regenerates absent ids on import, so only compare non-empty ids.
+      if (node.id && nodeIds.has(node.id)) {
         const firstNodeIndex = nodeIdToIndex.get(node.id);
         const firstNode = firstNodeIndex !== undefined ? workflow.nodes[firstNodeIndex] : undefined;
 
@@ -347,7 +632,7 @@ export class WorkflowValidator {
           nodeId: node.id,
           message: `Duplicate node ID: "${node.id}". Node at index ${i} (name: "${node.name}", type: "${node.type}") conflicts with node at index ${firstNodeIndex} (name: "${firstNode?.name || 'unknown'}", type: "${firstNode?.type || 'unknown'}"). Each node must have a unique ID. Generate a new UUID using crypto.randomUUID() - Example: {id: "${crypto.randomUUID()}", name: "${node.name}", type: "${node.type}", ...}`
         });
-      } else {
+      } else if (node.id) {
         nodeIds.add(node.id);
         nodeIdToIndex.set(node.id, i);
       }
@@ -367,6 +652,23 @@ export class WorkflowValidator {
   }
 
   /**
+   * Warn about a node on a deprecated typeVersion. A warning, not an error: the validator
+   * cannot tell a node the caller is adding or editing (which n8n rejects) from an untouched
+   * one in a saved workflow (which n8n accepts).
+   */
+  private checkDeprecatedNode(node: WorkflowNode, nodeInfo: any, result: WorkflowValidationResult): void {
+    if (!nodeInfo || !isDeprecatedNodeVersion(nodeInfo, node.typeVersion)) return;
+
+    result.warnings.push({
+      type: 'warning',
+      nodeId: node.id,
+      nodeName: node.name,
+      code: 'DEPRECATED_NODE',
+      message: `${deprecatedNodeMessage(node.type)} ${deprecatedNodeReplacementHint(nodeInfo.toolVariantOf ?? nodeInfo.nodeType)}`
+    });
+  }
+
+  /**
    * Validate all nodes in the workflow
    */
   private async validateAllNodes(
@@ -374,7 +676,28 @@ export class WorkflowValidator {
     result: WorkflowValidationResult,
     profile: string
   ): Promise<void> {
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): index of reported errors by node name and message
+    const reportedErrors = new Map<unknown, Set<unknown>>();
+    let reportedErrorsIndexed = 0;
+    const hasReportedError = (nodeName: string, message: string): boolean => {
+      for (; reportedErrorsIndexed < result.errors.length; reportedErrorsIndexed++) {
+        const e = result.errors[reportedErrorsIndexed];
+        let messages = reportedErrors.get(e.nodeName);
+        if (!messages) {
+          messages = new Set();
+          reportedErrors.set(e.nodeName, messages);
+        }
+        messages.add(e.message);
+      }
+      return reportedErrors.get(nodeName)?.has(message) ?? false;
+    };
+
     for (const node of workflow.nodes) {
+      // Looked up once per node and reused below. The deprecation check runs before the
+      // disabled skip: n8n checks disabled nodes too, and toggling one is an edit.
+      const storedNodeInfo = this.nodeRepository.getNode(NodeTypeNormalizer.normalizeToFullForm(node.type));
+      this.checkDeprecatedNode(node, storedNodeInfo, result);
+
       if (node.disabled || isNonExecutableNode(node.type)) continue;
 
       try {
@@ -413,8 +736,8 @@ export class WorkflowValidator {
         // but n8n API requires full form (n8n-nodes-base.*). Never modify the input workflow.
         const normalizedType = NodeTypeNormalizer.normalizeToFullForm(node.type);
 
-        // Get node definition using normalized type (needed for typeVersion validation)
-        let nodeInfo = this.nodeRepository.getNode(normalizedType);
+        // Node definition using the normalized type (needed for typeVersion validation)
+        let nodeInfo = storedNodeInfo;
 
         // Check if this is a dynamic Tool variant (e.g., googleDriveTool, googleSheetsTool)
         // n8n creates these at runtime when ANY node is used in an AI Agent's tool slot,
@@ -425,15 +748,13 @@ export class WorkflowValidator {
           if (baseNodeType) {
             const baseNodeInfo = this.nodeRepository.getNode(baseNodeType);
             if (baseNodeInfo) {
-              // Valid inferred tool variant - base node exists
-              result.warnings.push({
-                type: 'warning',
-                nodeId: node.id,
-                nodeName: node.name,
-                message: `Node type "${node.type}" is inferred as a dynamic AI Tool variant of "${baseNodeType}". ` +
-                  `This Tool variant is created by n8n at runtime when connecting "${baseNodeInfo.displayName}" to an AI Agent.`,
-                code: 'INFERRED_TOOL_VARIANT'
-              });
+              // Valid inferred tool variant - base node exists. This is
+              // informational (the config is fine), so it rides the
+              // suggestions channel rather than warnings.
+              result.suggestions.push(
+                `Node type "${node.type}" is inferred as a dynamic AI Tool variant of "${baseNodeType}". ` +
+                  `This Tool variant is created by n8n at runtime when connecting "${baseNodeInfo.displayName}" to an AI Agent.`
+              );
 
               // Create synthetic nodeInfo for validation continuity
               nodeInfo = {
@@ -449,24 +770,20 @@ export class WorkflowValidator {
         }
 
         if (!nodeInfo) {
-          // Check if this is a community node (dotted type that isn't base/langchain)
-          const typeDetails = NodeTypeNormalizer.normalizeWithDetails(node.type);
-          if (typeDetails.package === 'community') {
-            result.warnings.push({
-              type: 'warning',
-              nodeId: node.id,
-              nodeName: node.name,
-              message: `Community node "${node.type}" is not in the MCP catalog. ` +
-                `Validation of its parameters is skipped. Install the node in n8n and ensure it works at runtime.`,
-              code: 'COMMUNITY_NODE_NOT_IN_CATALOG'
-            });
-            continue;
-          }
 
-          // Non-community unknown node — emit error with similarity suggestions
+          // Use NodeSimilarityService to find suggestions
           const suggestions = await this.similarityService.findSimilarNodes(node.type, 3);
 
+          // Community-prefixed types may simply be absent from this server's
+          // node database while installed on the target instance, so they are
+          // reported as warnings. Core-prefixed and prefix-less unknowns are
+          // always real failures.
+          const isCommunityType = !this.isCorePackageType(normalizedType) && normalizedType.includes('.');
+
           let message = `Unknown node type: "${node.type}".`;
+          if (isCommunityType) {
+            message += ' This looks like a community node that is not in this server\'s node database — the workflow can still run on an n8n instance where the package is installed.';
+          }
 
           if (suggestions.length > 0) {
             message += '\n\nDid you mean one of these?';
@@ -481,12 +798,12 @@ export class WorkflowValidator {
                 message += ' (can be auto-fixed)';
               }
             }
-          } else {
+          } else if (!isCommunityType) {
             message += ' No similar nodes found. Node types must include the package prefix (e.g., "n8n-nodes-base.webhook").';
           }
 
-          const error: any = {
-            type: 'error',
+          const issue: any = {
+            type: isCommunityType ? 'warning' : 'error',
             nodeId: node.id,
             nodeName: node.name,
             message
@@ -494,14 +811,18 @@ export class WorkflowValidator {
 
           // Add suggestions as metadata for programmatic access
           if (suggestions.length > 0) {
-            error.suggestions = suggestions.map(s => ({
+            issue.suggestions = suggestions.map(s => ({
               nodeType: s.nodeType,
               confidence: s.confidence,
               reason: s.reason
             }));
           }
 
-          result.errors.push(error);
+          if (isCommunityType) {
+            result.warnings.push(issue);
+          } else {
+            result.errors.push(issue);
+          }
           continue;
         }
 
@@ -547,23 +868,37 @@ export class WorkflowValidator {
               message: `Invalid typeVersion: ${node.typeVersion}. Must be a finite non-negative number`
             });
           }
-          // Check if typeVersion is outdated (less than latest)
+          // Check if typeVersion is outdated (less than latest). Old
+          // typeVersions are supported by design (that is the point of
+          // versioning), so this is advisory only and gated to the
+          // advisory profiles.
           else if (maxVersion !== null && node.typeVersion < maxVersion) {
-            result.warnings.push({
-              type: 'warning',
-              nodeId: node.id,
-              nodeName: node.name,
-              message: `Outdated typeVersion: ${node.typeVersion}. Latest is ${maxVersion}`
-            });
+            if (this.isAdvisoryProfile(profile)) {
+              result.suggestions.push(
+                `Outdated typeVersion for node "${node.name}": ${node.typeVersion}. Latest is ${maxVersion}.`
+              );
+            }
           }
-          // Check if typeVersion exceeds maximum supported
+          // Check if typeVersion exceeds maximum supported.
+          // For core packages this is a real activation failure; for community
+          // packages the DB snapshot may simply be older than the installed
+          // package, so only warn.
           else if (maxVersion !== null && node.typeVersion > maxVersion) {
-            result.errors.push({
-              type: 'error',
-              nodeId: node.id,
-              nodeName: node.name,
-              message: `typeVersion ${node.typeVersion} exceeds maximum supported version ${maxVersion}`
-            });
+            if (this.isCorePackageType(normalizedType)) {
+              result.errors.push({
+                type: 'error',
+                nodeId: node.id,
+                nodeName: node.name,
+                message: `typeVersion ${node.typeVersion} exceeds maximum supported version ${maxVersion}`
+              });
+            } else {
+              result.warnings.push({
+                type: 'warning',
+                nodeId: node.id,
+                nodeName: node.name,
+                message: `typeVersion ${node.typeVersion} exceeds maximum supported version ${maxVersion} known to this server. The community package may be newer than this server's data — verify the version exists in your installed package.`
+              });
+            }
           }
         }
 
@@ -614,10 +949,15 @@ export class WorkflowValidator {
           });
         });
 
-        // Validate If/Switch conditions structure (version-conditional)
-        if (node.type === 'n8n-nodes-base.if' || node.type === 'n8n-nodes-base.switch') {
-          const conditionErrors = validateConditionNodeStructure(node as any);
-          for (const err of conditionErrors) {
+        this.checkNativeAlternative(node, profile, result);
+        this.checkHttpRequestCredential(node, profile, result);
+
+        // The config validator above already runs the operator checks, but it keeps one
+        // error per property; this direct call reports every operator, skipping the one the
+        // config validator already surfaced so nothing appears twice.
+        if (node.type === 'n8n-nodes-base.if' || node.type === 'n8n-nodes-base.switch' || node.type === 'n8n-nodes-base.filter') {
+          for (const err of validateConditionNodeStructure(node as any)) {
+            if (hasReportedError(node.name, err)) continue;
             result.errors.push({
               type: 'error',
               nodeId: node.id,
@@ -691,6 +1031,7 @@ export class WorkflowValidator {
           continue;
         }
 
+        // Belt and braces since the shape gate: a non-array output no longer reaches this pass.
         if (!outputConnections || !Array.isArray(outputConnections)) continue;
 
         // Validate that the source node can actually output ai_tool
@@ -709,7 +1050,8 @@ export class WorkflowValidator {
           nodeMap,
           nodeIdMap,
           result,
-          outputKey
+          outputKey,
+          profile
         );
       }
     }
@@ -721,11 +1063,14 @@ export class WorkflowValidator {
       this.flagOrphanedNodes(workflow, result);
     }
 
-    // Check for cycles (skip in minimal profile to reduce false positives)
+    // Check for cycles (skip in minimal profile to reduce false positives).
+    // Warning, not error: n8n imposes no static cycle rejection, and cycles
+    // routinely terminate via mechanisms invisible to topology analysis
+    // (empty-output pagination, error-retry, poll loops) — live-verified.
     if (profile !== 'minimal' && this.hasCycle(workflow)) {
-      result.errors.push({
-        type: 'error',
-        message: 'Workflow contains a cycle (infinite loop)'
+      result.warnings.push({
+        type: 'warning',
+        message: 'Workflow contains a cycle with no recognized exit. Verify the loop can terminate (e.g. via a conditional branch, an error output, or a node that can return zero items).'
       });
     }
   }
@@ -735,18 +1080,19 @@ export class WorkflowValidator {
    */
   private validateConnectionOutputs(
     sourceName: string,
-    outputs: Array<Array<{ node: string; type: string; index: number }>>,
+    outputs: ConnectionBranch[],
     nodeMap: Map<string, WorkflowNode>,
     nodeIdMap: Map<string, WorkflowNode>,
     result: WorkflowValidationResult,
-    outputType: string
+    outputType: string,
+    profile: string = 'runtime'
   ): void {
     // Get source node for special validation
     const sourceNode = nodeMap.get(sourceName);
 
     // Main-output-specific validation: error handling config and index bounds
     if (outputType === 'main' && sourceNode) {
-      this.validateErrorOutputConfiguration(sourceName, sourceNode, outputs, nodeMap, result);
+      this.validateErrorOutputConfiguration(sourceName, sourceNode, outputs, nodeMap, result, profile);
       this.validateOutputIndexBounds(sourceNode, outputs, result);
       this.validateConditionalBranchUsage(sourceNode, outputs, result);
     }
@@ -835,11 +1181,6 @@ export class WorkflowValidator {
         } else {
           result.statistics.validConnections++;
 
-          // Additional validation for AI tool connections
-          if (outputType === 'ai_tool') {
-            this.validateAIToolConnection(sourceName, targetNode, result);
-          }
-
           // Input index bounds checking
           if (outputType === 'main') {
             this.validateInputIndexBounds(sourceName, targetNode, connection, result);
@@ -850,118 +1191,77 @@ export class WorkflowValidator {
   }
 
   /**
+   * A fan-out from main[0] that includes a node named like an error handler says nothing by
+   * itself: the name is a naming choice, and Respond to Webhook or Email Send beside a
+   * side-effect node is an ordinary success path; moving such a node to the error output would
+   * make it run only on failure (#1111). It is worth a note only when the source routes
+   * failures to an error output that nothing consumes, as a hint appended to that warning.
+   */
+  private describeHandlersOnSuccessOutput(
+    outputs: ConnectionBranch[],
+    nodeMap: Map<string, WorkflowNode>,
+    errorOutputIndex: number
+  ): string {
+    if (!outputs[0] || outputs[0].length < 2) return '';
+    const namedLikeHandlers = outputs[0].filter(conn => {
+      const targetNode = nodeMap.get(conn.node);
+      return !!targetNode && /error|fail|catch|exception/.test(targetNode.name.toLowerCase());
+    });
+    if (namedLikeHandlers.length === 0) return '';
+    const isSingle = namedLikeHandlers.length === 1;
+    const names = namedLikeHandlers.map(conn => `"${conn.node}"`).join(', ');
+    return ` ${names} in main[0] ${isSingle ? 'is' : 'are'} named like an error handler: ` +
+           `if ${isSingle ? 'it handles' : 'they handle'} failed items, connect ${isSingle ? 'it' : 'them'} to main[${errorOutputIndex}] instead; ` +
+           `if ${isSingle ? 'it runs' : 'they run'} on success, leave the connection as it is.`;
+  }
+
+  /**
    * Validate error output configuration
    */
   private validateErrorOutputConfiguration(
     sourceName: string,
     sourceNode: WorkflowNode,
-    outputs: Array<Array<{ node: string; type: string; index: number }>>,
+    outputs: ConnectionBranch[],
     nodeMap: Map<string, WorkflowNode>,
-    result: WorkflowValidationResult
+    result: WorkflowValidationResult,
+    profile: string = 'runtime'
   ): void {
     // Check if node has onError: 'continueErrorOutput'
     const hasErrorOutputSetting = sourceNode.onError === 'continueErrorOutput';
-    const hasErrorConnections = outputs.length > 1 && outputs[1] && outputs[1].length > 0;
 
-    // Validate mismatch between onError setting and connections
-    if (hasErrorOutputSetting && !hasErrorConnections) {
-      result.errors.push({
-        type: 'error',
-        nodeId: sourceNode.id,
-        nodeName: sourceNode.name,
-        message: `Node has onError: 'continueErrorOutput' but no error output connections in main[1]. Add error handler connections to main[1] or change onError to 'continueRegularOutput' or 'stopWorkflow'.`
-      });
-    }
+    // The error output is the extra, LAST output after the node's natural main
+    // outputs (index = natural count) — main[1] is a normal branch on IF/Switch/
+    // SplitInBatches. Skip the mismatch checks when the count is unknown.
+    const errorOutputIndex = this.getMainOutputCount(sourceNode);
+    const hasErrorConnections =
+      errorOutputIndex !== null &&
+      outputs.length > errorOutputIndex &&
+      !!outputs[errorOutputIndex] &&
+      outputs[errorOutputIndex].length > 0;
 
-    if (!hasErrorOutputSetting && hasErrorConnections) {
-      result.warnings.push({
-        type: 'warning',
-        nodeId: sourceNode.id,
-        nodeName: sourceNode.name,
-        message: `Node has error output connections in main[1] but missing onError: 'continueErrorOutput'. Add this property to properly handle errors.`
-      });
-    }
-
-    // Check for common mistake: multiple nodes in main[0] when error handling is intended
-    if (outputs.length >= 1 && outputs[0] && outputs[0].length > 1) {
-      // Check if any of the nodes in main[0] look like error handlers
-      const potentialErrorHandlers = outputs[0].filter(conn => {
-        const targetNode = nodeMap.get(conn.node);
-        if (!targetNode) return false;
-
-        const nodeName = targetNode.name.toLowerCase();
-        const nodeType = targetNode.type.toLowerCase();
-
-        // Common patterns for error handler nodes
-        return nodeName.includes('error') ||
-               nodeName.includes('fail') ||
-               nodeName.includes('catch') ||
-               nodeName.includes('exception') ||
-               nodeType.includes('respondtowebhook') ||
-               nodeType.includes('emailsend');
-      });
-
-      if (potentialErrorHandlers.length > 0) {
-        const errorHandlerNames = potentialErrorHandlers.map(conn => `"${conn.node}"`).join(', ');
-        result.errors.push({
-          type: 'error',
+    if (errorOutputIndex !== null) {
+      // Both mismatch checks are lint, not validity: n8n runs either config.
+      // An unwired error output just drops failed items (live-verified).
+      if (hasErrorOutputSetting && !hasErrorConnections && profile !== 'minimal') {
+        result.warnings.push({
+          type: 'warning',
           nodeId: sourceNode.id,
           nodeName: sourceNode.name,
-          message: `Incorrect error output configuration. Nodes ${errorHandlerNames} appear to be error handlers but are in main[0] (success output) along with other nodes.\n\n` +
-                   `INCORRECT (current):\n` +
-                   `"${sourceName}": {\n` +
-                   `  "main": [\n` +
-                   `    [  // main[0] has multiple nodes mixed together\n` +
-                   outputs[0].map(conn => `      {"node": "${conn.node}", "type": "${conn.type}", "index": ${conn.index}}`).join(',\n') + '\n' +
-                   `    ]\n` +
-                   `  ]\n` +
-                   `}\n\n` +
-                   `CORRECT (should be):\n` +
-                   `"${sourceName}": {\n` +
-                   `  "main": [\n` +
-                   `    [  // main[0] = success output\n` +
-                   outputs[0].filter(conn => !potentialErrorHandlers.includes(conn)).map(conn => `      {"node": "${conn.node}", "type": "${conn.type}", "index": ${conn.index}}`).join(',\n') + '\n' +
-                   `    ],\n` +
-                   `    [  // main[1] = error output\n` +
-                   potentialErrorHandlers.map(conn => `      {"node": "${conn.node}", "type": "${conn.type}", "index": ${conn.index}}`).join(',\n') + '\n' +
-                   `    ]\n` +
-                   `  ]\n` +
-                   `}\n\n` +
-                   `Also add: "onError": "continueErrorOutput" to the "${sourceName}" node.`
+          message: `Node has onError: 'continueErrorOutput' but the error output (main[${errorOutputIndex}]) is not connected — failed items are silently dropped. Connect an error handler to main[${errorOutputIndex}] or change onError to 'continueRegularOutput' or 'stopWorkflow'.` +
+                   this.describeHandlersOnSuccessOutput(outputs, nodeMap, errorOutputIndex)
+        });
+      }
+
+      if (!hasErrorOutputSetting && hasErrorConnections) {
+        result.warnings.push({
+          type: 'warning',
+          nodeId: sourceNode.id,
+          nodeName: sourceNode.name,
+          message: `Node has error output connections in main[${errorOutputIndex}] but missing onError: 'continueErrorOutput'. Add this property to properly handle errors.`
         });
       }
     }
-  }
 
-  /**
-   * Validate AI tool connections
-   */
-  private validateAIToolConnection(
-    sourceName: string,
-    targetNode: WorkflowNode,
-    result: WorkflowValidationResult
-  ): void {
-    // For AI tool connections, we just need to check if this is being used as a tool
-    // The source should be an AI Agent connecting to this target node as a tool
-    
-    // Get target node info to check if it can be used as a tool
-    const normalizedType = NodeTypeNormalizer.normalizeToFullForm(targetNode.type);
-    let targetNodeInfo = this.nodeRepository.getNode(normalizedType);
-
-    // Try original type if normalization didn't help (fallback for edge cases)
-    if (!targetNodeInfo && normalizedType !== targetNode.type) {
-      targetNodeInfo = this.nodeRepository.getNode(targetNode.type);
-    }
-    
-    if (targetNodeInfo && !targetNodeInfo.isAITool && targetNodeInfo.package !== 'n8n-nodes-base') {
-      // It's a community node being used as a tool
-      result.warnings.push({
-        type: 'warning',
-        nodeId: targetNode.id,
-        nodeName: targetNode.name,
-        message: `Community node "${targetNode.name}" is being used as an AI tool. Verify that its installed version declares usableAsTool and use its Tool variant.`
-      });
-    }
   }
 
   /**
@@ -970,9 +1270,13 @@ export class WorkflowValidator {
    * Valid ai_tool sources are:
    * 1. Langchain tool nodes (in AI_TOOL_VALIDATORS)
    * 2. Tool variant nodes (e.g., nodes-base.supabaseTool)
+   * 3. Nodes whose dynamic outputs expression can emit ai_tool
+   *    (vector stores with mode 'retrieve-as-tool')
+   * 4. Nodes the database marks isAITool
    *
    * If a base node (e.g., nodes-base.supabase) is used with ai_tool connection
-   * but it has a Tool variant available, this is an error.
+   * but it has a Tool variant available, this is an error. Community sources
+   * additionally get the N8N_COMMUNITY_PACKAGES_ALLOW_TOOL_USAGE notice.
    */
   private validateAIToolSource(
     sourceNode: WorkflowNode,
@@ -988,6 +1292,15 @@ export class WorkflowValidator {
     // Get node info from repository (single lookup, reused below)
     const nodeInfo = this.nodeRepository.getNode(normalizedType);
 
+    // N8N_COMMUNITY_PACKAGES_ALLOW_TOOL_USAGE gates community packages as tools
+    // at all, so this applies even when the node declares usableAsTool. It tests
+    // the database's community flag rather than the package name, which would
+    // sweep in first-party @n8n/* packages (#955), and it fires on the tool (the
+    // ai_tool source), not on the agent receiving the connection.
+    if (nodeInfo?.isCommunity) {
+      this.pushCommunityToolUsageWarning(sourceNode, result);
+    }
+
     // Check if it's a Tool variant (ends with Tool and is in database as isToolVariant)
     if (ToolVariantGenerator.isToolVariantNodeType(normalizedType)) {
       // It looks like a Tool variant, verify it exists in database
@@ -997,8 +1310,32 @@ export class WorkflowValidator {
     }
 
     if (!nodeInfo) {
-      // Node not found in database - might be a community node or unknown
-      // Don't error here, let other validation handle unknown nodes
+      // Node not found in database - other validation reports unknown node
+      // types, so no error here. A package-qualified non-core type is commonly
+      // a user-installed community package the bundled database doesn't know;
+      // it still needs the environment variable to serve as a tool, so keep
+      // that guidance, which the pre-#955 target-side check emitted by accident.
+      if (!this.isCorePackageType(normalizedType) && normalizedType.includes('.')) {
+        this.pushCommunityToolUsageWarning(sourceNode, result);
+      }
+      return;
+    }
+
+    // Nodes may declare outputs as an expression evaluated against the node's
+    // parameters, so a connection type can exist only for particular values —
+    // vector stores expose ai_tool only when mode is 'retrieve-as-tool'. The
+    // database stores the raw expression; scan it for ai_tool instead of
+    // maintaining a list of the nodes that do this. The scan is deliberately
+    // permissive: any expression that can produce ai_tool passes, even when the
+    // current parameters would not produce it (the LangChain Code node lists
+    // ai_tool in a connector lookup, for example). Beyond the retrieve-as-tool
+    // mode gate checked below, under-warning beats reinstating the false
+    // INVALID_AI_TOOL_SOURCE this replaced.
+    const aiToolOutputExpression = this.findConditionalAIToolExpression(nodeInfo.outputs);
+    if (aiToolOutputExpression) {
+      // Valid - the node emits ai_tool for the right parameter values, but the
+      // current parameters may not be those values.
+      this.validateConditionalAIToolMode(sourceNode, aiToolOutputExpression, result);
       return;
     }
 
@@ -1038,6 +1375,76 @@ export class WorkflowValidator {
       message: `Node "${sourceNode.name}" of type "${sourceNode.type}" cannot output ai_tool connections. ` +
         `Only AI tool nodes (e.g., Calculator, HTTP Request Tool) or Tool variants (e.g., *Tool suffix nodes) can be connected to AI Agents as tools.`,
       code: 'INVALID_AI_TOOL_SOURCE'
+    });
+  }
+
+  private pushCommunityToolUsageWarning(
+    sourceNode: WorkflowNode,
+    result: WorkflowValidationResult
+  ): void {
+    result.warnings.push({
+      type: 'warning',
+      nodeId: sourceNode.id,
+      nodeName: sourceNode.name,
+      message: `Community node "${sourceNode.name}" is being used as an AI tool. Ensure N8N_COMMUNITY_PACKAGES_ALLOW_TOOL_USAGE=true is set on the n8n instance.`
+    });
+  }
+
+  /**
+   * Find a dynamic output expression that can produce an ai_tool output.
+   * Returns the expression string so the caller can inspect the gating
+   * parameter, or null when the node's outputs are static or never
+   * include ai_tool.
+   */
+  private findConditionalAIToolExpression(outputs: unknown): string | null {
+    // Community ingestion stores nodeDesc.outputs verbatim, so a conditional
+    // expression can arrive as a bare string rather than a one-element array.
+    const candidates =
+      Array.isArray(outputs) ? outputs :
+      typeof outputs === 'string' ? [outputs] :
+      [];
+
+    return candidates.find(
+      (output): output is string =>
+        typeof output === 'string' && output.startsWith('={{') && output.includes('ai_tool')
+    ) ?? null;
+  }
+
+  /**
+   * Warn when a node whose ai_tool output is gated on `mode` is not set to the
+   * mode that exposes it. Stays silent when mode is itself an expression, which
+   * cannot be evaluated statically.
+   */
+  private validateConditionalAIToolMode(
+    sourceNode: WorkflowNode,
+    outputExpression: string,
+    result: WorkflowValidationResult
+  ): void {
+    if (!outputExpression.includes('retrieve-as-tool')) return;
+
+    const mode = sourceNode.parameters?.mode;
+    // null and undefined both mean "unset - the node's default mode applies"
+    const isUnset = mode === undefined || mode === null;
+    const isStaticMode = isUnset || (typeof mode === 'string' && !mode.startsWith('='));
+    if (!isStaticMode || mode === 'retrieve-as-tool') return;
+
+    // When mode is unset, the expression's own `?? '<default>'` fallback decides
+    // which output exists. Warn only when that default is identifiable and
+    // demonstrably not retrieve-as-tool - staying silent otherwise keeps this
+    // false-positive-safe if a future node defaults differently.
+    if (isUnset) {
+      const defaultMode = outputExpression.match(/\?\?\s*'([^']+)'/)?.[1];
+      if (defaultMode === undefined || defaultMode === 'retrieve-as-tool') return;
+    }
+
+    result.warnings.push({
+      type: 'warning',
+      nodeId: sourceNode.id,
+      nodeName: sourceNode.name,
+      message: `Node "${sourceNode.name}" connects to an AI Agent as a tool, but its ai_tool output only exists when mode is "retrieve-as-tool"` +
+        (isUnset ? ' (mode is not set, so the default applies)' : ` (current mode: "${mode}")`) +
+        `. Set mode to "retrieve-as-tool".`,
+      code: 'AI_TOOL_MODE_MISMATCH'
     });
   }
 
@@ -1101,19 +1508,157 @@ export class WorkflowValidator {
   }
 
   /**
+   * Whether a normalized (short-form) node type belongs to one of the core
+   * packages shipped with n8n (n8n-nodes-base / @n8n/n8n-nodes-langchain).
+   */
+  private isCorePackageType(normalizedType: string): boolean {
+    return normalizedType.startsWith('nodes-base.') || normalizedType.startsWith('nodes-langchain.');
+  }
+
+  /**
+   * Advisory profiles surface best-practice guidance (error-handling nudges,
+   * outdated-typeVersion notices, maintainability notes) that fail-loud runtime
+   * defaults make optional. The leaner profiles suppress it as noise.
+   */
+  private isAdvisoryProfile(profile: string): boolean {
+    return profile === 'ai-friendly' || profile === 'strict';
+  }
+
+  /**
+   * A short JavaScript Code node whose whole job a native node does (map fields,
+   * collect values, split a list, sort, ...). A warning under the advisory
+   * profiles, a suggestion under runtime, nothing under minimal. Notes starting
+   * with "Why Code:" opt the node out.
+   */
+  private checkNativeAlternative(node: WorkflowNode, profile: string, result: WorkflowValidationResult): void {
+    if (profile === 'minimal' || node.type !== 'n8n-nodes-base.code') return;
+    const parameters = node.parameters ?? {};
+    if ((parameters.language ?? 'javaScript') !== 'javaScript') return;
+    if (typeof node.notes === 'string' && /^\s*why code:/i.test(node.notes)) return;
+
+    const alternative = findNativeAlternative(parameters.jsCode, parameters.mode);
+    if (!alternative) return;
+
+    // A Code node set to execute once sees only its first input item; so must the native node
+    const runOnce = alternative.executeOnce || node.executeOnce === true ? ' with its "Execute Once" setting on' : '';
+    const nativeNode = `the ${alternative.node} node (${alternative.nodeType})${runOnce} does this without code.`;
+    const message = `Code node "${node.name}" only ${alternative.does}. ` +
+      (alternative.when ? `If ${alternative.when}, ${nativeNode}` : nativeNode.charAt(0).toUpperCase() + nativeNode.slice(1)) +
+      ' If this needs a Code node, start its notes with "Why Code:" and the reason.';
+    if (this.isAdvisoryProfile(profile)) {
+      result.warnings.push({ type: 'warning', nodeId: node.id, nodeName: node.name, message, code: 'NATIVE_ALTERNATIVE' });
+    } else {
+      result.suggestions.push(message);
+    }
+  }
+
+  /**
+   * An HTTP Request node signed with a service credential that a native node
+   * uses: point at that node, unless it lacks the operation. A suggestion under
+   * the advisory profiles only: the credential says nothing about whether the
+   * node covers the endpoint.
+   */
+  private checkHttpRequestCredential(node: WorkflowNode, profile: string, result: WorkflowValidationResult): void {
+    if (!this.isAdvisoryProfile(profile) || node.type !== 'n8n-nodes-base.httpRequest') return;
+    const parameters = node.parameters ?? {};
+    const credentialType = parameters.nodeCredentialType;
+    if (parameters.authentication !== 'predefinedCredentialType' || typeof credentialType !== 'string') return;
+    if (isGenericCredentialType(credentialType)) return;
+
+    const nodes = this.actionNodesByCredential()?.get(credentialType);
+    // A credential shared by many nodes (aws, googleApi) does not say which node fits
+    if (!nodes || nodes.length === 0 || nodes.length > 3) return;
+
+    const names = nodes.join(' or ');
+    result.suggestions.push(
+      `HTTP Request node "${node.name}" uses the ${credentialType} credential of the ${names} node. ` +
+      `Use the ${names} node unless it lacks this operation.`
+    );
+  }
+
+  private actionNodesByCredential(): Map<string, string[]> | undefined {
+    const repository = this.nodeRepository;
+    // Repository stubs may not have this method
+    if (typeof repository.getActionNodesByCredentialType !== 'function') return undefined;
+    let map = ACTION_NODES_BY_CREDENTIAL.get(repository);
+    if (!map) {
+      try {
+        map = repository.getActionNodesByCredentialType();
+      } catch (error) {
+        // A hint must not turn into a node validation failure
+        logger.debug('Could not build the credential map for the HTTP Request hint', error);
+        map = new Map();
+      }
+      ACTION_NODES_BY_CREDENTIAL.set(repository, map);
+    }
+    return map;
+  }
+
+  /**
+   * Natural (non-error) main output count for a node, from its DB description
+   * with dynamic overrides for conditional nodes (IF/Filter/Switch).
+   *
+   * The error output added by onError: 'continueErrorOutput' is the extra,
+   * LAST output, so its index equals this count. Returns null when the count
+   * cannot be determined (unknown node, dynamic outputs expression, Switch
+   * without determinable rules, no main outputs).
+   */
+  private getMainOutputCount(sourceNode: WorkflowNode): number | null {
+    const normalizedType = NodeTypeNormalizer.normalizeToFullForm(sourceNode.type);
+    const nodeInfo = this.nodeRepository.getNode(normalizedType);
+    if (!nodeInfo || !nodeInfo.outputs) return null;
+
+    // Conditional nodes first: the bundled Switch metadata carries its outputs as an
+    // expression, so the count has to come from the node's own rules.
+    const conditionalInfo = this.getConditionalOutputInfo(sourceNode);
+    if (conditionalInfo) {
+      return conditionalInfo.expectedOutputs;
+    }
+    if (this.getShortNodeType(sourceNode) === 'switch') {
+      return null; // Switch without determinable rules
+    }
+    if (!Array.isArray(nodeInfo.outputs)) return null; // Dynamic outputs (expression string)
+
+    // outputs can be strings like "main" or objects with { type: "main" }
+    const mainOutputCount = nodeInfo.outputs.filter((o: any) =>
+      typeof o === 'string' ? o === 'main' : (o.type === 'main' || !o.type)
+    ).length;
+    if (mainOutputCount === 0) return null;
+
+    return mainOutputCount;
+  }
+
+  /**
    * Get the expected main output count for a conditional node (IF, Filter, Switch).
    * Returns null for non-conditional nodes or when the count cannot be determined.
    */
   private getConditionalOutputInfo(sourceNode: WorkflowNode): { shortType: string; expectedOutputs: number } | null {
     const shortType = this.getShortNodeType(sourceNode);
 
-    if (shortType === 'if' || shortType === 'filter') {
+    // IF has true/false; Filter has one output (Discarded is only a name in the metadata).
+    if (shortType === 'if') {
       return { shortType, expectedOutputs: 2 };
     }
+    if (shortType === 'filter') {
+      return { shortType, expectedOutputs: 1 };
+    }
     if (shortType === 'switch') {
-      const rules = sourceNode.parameters?.rules?.values || sourceNode.parameters?.rules;
+      // Switch v1 has four fixed outputs whatever its rules say.
+      if ((sourceNode.typeVersion || 1) < 2) return { shortType, expectedOutputs: 4 };
+      const params = sourceNode.parameters as any;
+      // Expression mode routes by `output` into `numberOutputs` outputs; a retained rule
+      // collection is ignored by n8n and must not set the count. Any other non-rules mode
+      // is unknown here.
+      if (params?.mode === 'expression') {
+        const count = Number(params?.numberOutputs);
+        return Number.isInteger(count) && count > 0 ? { shortType, expectedOutputs: count } : null;
+      }
+      if (params?.mode && params.mode !== 'rules') return null;
+      const rules = params?.rules?.values ?? params?.rules?.rules;
       if (Array.isArray(rules)) {
-        return { shortType, expectedOutputs: rules.length + 1 }; // rules + fallback
+        // Only `fallbackOutput: 'extra'` adds an output; 'none' or an output index does not.
+        const fallbackOutput = params?.options?.fallbackOutput ?? params?.fallbackOutput;
+        return { shortType, expectedOutputs: rules.length + (fallbackOutput === 'extra' ? 1 : 0) };
       }
       return null; // Cannot determine dynamic output count
     }
@@ -1125,34 +1670,13 @@ export class WorkflowValidator {
    */
   private validateOutputIndexBounds(
     sourceNode: WorkflowNode,
-    outputs: Array<Array<{ node: string; type: string; index: number }>>,
+    outputs: ConnectionBranch[],
     result: WorkflowValidationResult
   ): void {
-    const normalizedType = NodeTypeNormalizer.normalizeToFullForm(sourceNode.type);
-    const nodeInfo = this.nodeRepository.getNode(normalizedType);
-    if (!nodeInfo || !nodeInfo.outputs) return;
+    const naturalOutputCount = this.getMainOutputCount(sourceNode);
+    if (naturalOutputCount === null) return; // Unknown or dynamic — skip check
 
-    // Count main outputs from node description
-    let mainOutputCount: number;
-    if (Array.isArray(nodeInfo.outputs)) {
-      // outputs can be strings like "main" or objects with { type: "main" }
-      mainOutputCount = nodeInfo.outputs.filter((o: any) =>
-        typeof o === 'string' ? o === 'main' : (o.type === 'main' || !o.type)
-      ).length;
-    } else {
-      return; // Dynamic outputs (expression string), skip check
-    }
-
-    if (mainOutputCount === 0) return;
-
-    // Override with dynamic output counts for conditional nodes
-    const conditionalInfo = this.getConditionalOutputInfo(sourceNode);
-    if (conditionalInfo) {
-      mainOutputCount = conditionalInfo.expectedOutputs;
-    } else if (this.getShortNodeType(sourceNode) === 'switch') {
-      // Switch without determinable rules -- skip bounds check
-      return;
-    }
+    let mainOutputCount = naturalOutputCount;
 
     // Account for continueErrorOutput adding an extra output
     if (sourceNode.onError === 'continueErrorOutput') {
@@ -1164,13 +1688,16 @@ export class WorkflowValidator {
     if (maxOutputIndex >= mainOutputCount) {
       // Only flag if there are actual connections at the out-of-bounds indices
       for (let i = mainOutputCount; i < outputs.length; i++) {
-        if (outputs[i] && outputs[i].length > 0) {
+        const branch = outputs[i];
+        if (branch && branch.length > 0) {
           result.errors.push({
             type: 'error',
             nodeId: sourceNode.id,
             nodeName: sourceNode.name,
             message: `Output index ${i} on node "${sourceNode.name}" exceeds its output count (${mainOutputCount}). ` +
-              `This node has ${mainOutputCount} main output(s) (indices 0-${mainOutputCount - 1}).`,
+              (mainOutputCount > 0
+                ? `This node has ${mainOutputCount} main output(s) (indices 0-${mainOutputCount - 1}).`
+                : 'This node has no main outputs; add rules or a fallback output before connecting it.'),
             code: 'OUTPUT_INDEX_OUT_OF_BOUNDS'
           });
           result.statistics.invalidConnections++;
@@ -1187,7 +1714,7 @@ export class WorkflowValidator {
    */
   private validateConditionalBranchUsage(
     sourceNode: WorkflowNode,
-    outputs: Array<Array<{ node: string; type: string; index: number }>>,
+    outputs: ConnectionBranch[],
     result: WorkflowValidationResult
   ): void {
     const conditionalInfo = this.getConditionalOutputInfo(sourceNode);
@@ -1263,21 +1790,45 @@ export class WorkflowValidator {
       return;
     }
 
-    // Merge/CompareDatasets: read dynamic numberInputs parameter (defaults to 2)
+    // Merge/CompareDatasets: read dynamic numberInputs parameter
     if (shortType === 'merge' || shortType === 'compareDatasets') {
       const rawInputs = targetNode.parameters?.numberInputs;
-      const parsed = rawInputs ? Number(rawInputs) : 2;
-      const mainInputCount = Number.isFinite(parsed) ? parsed : 2;
 
-      if (connection.index >= mainInputCount) {
-        result.errors.push({
-          type: 'error',
+      // Hard error ONLY when numberInputs is explicitly configured and exceeded.
+      if (rawInputs != null && rawInputs !== '') {
+        if (typeof rawInputs === 'string' && rawInputs.trim().startsWith('=')) {
+          return; // Expression — input count unknown statically, skip check
+        }
+        const parsed = Number(rawInputs);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          return; // Unparseable value — cannot verify, skip check
+        }
+        if (connection.index >= parsed) {
+          result.errors.push({
+            type: 'error',
+            nodeName: targetNode.name,
+            message: `Input index ${connection.index} on node "${targetNode.name}" exceeds its input count (${parsed}). ` +
+              `Connection from "${sourceName}" targets input ${connection.index}, but this node has ${parsed} main input(s) (indices 0-${parsed - 1}).`,
+            code: 'INPUT_INDEX_OUT_OF_BOUNDS'
+          });
+          result.statistics.invalidConnections++;
+        }
+        return;
+      }
+
+      // numberInputs absent: n8n falls back to its default (2) and silently
+      // ignores connections to higher inputs — the workflow still runs
+      // (live-verified), so this is a data-loss warning, not an error.
+      const defaultInputs = 2;
+      if (connection.index >= defaultInputs) {
+        result.warnings.push({
+          type: 'warning',
           nodeName: targetNode.name,
-          message: `Input index ${connection.index} on node "${targetNode.name}" exceeds its input count (${mainInputCount}). ` +
-            `Connection from "${sourceName}" targets input ${connection.index}, but this node has ${mainInputCount} main input(s) (indices 0-${mainInputCount - 1}).`,
-          code: 'INPUT_INDEX_OUT_OF_BOUNDS'
+          message: `Input index ${connection.index} on node "${targetNode.name}" exceeds the default input count (${defaultInputs}) — ` +
+            `numberInputs is not set, so n8n will ignore this connection and drop items from "${sourceName}". ` +
+            `Set numberInputs to at least ${connection.index + 1} to use this input.`,
+          code: 'MERGE_EXTRA_INPUTS_IGNORED'
         });
-        result.statistics.invalidConnections++;
       }
       return;
     }
@@ -1297,16 +1848,22 @@ export class WorkflowValidator {
   ): void {
     const connectedNodes = new Set<string>();
     for (const [sourceName, outputs] of Object.entries(workflow.connections)) {
-      connectedNodes.add(sourceName);
+      // A source key with no targets (`main: [[]]`, `main: [null]`) is how n8n stores a node
+      // whose last edge was removed; it does not make the node connected (#1101).
+      let hasTarget = false;
       for (const outputConns of Object.values(outputs)) {
         if (!Array.isArray(outputConns)) continue;
         for (const conns of outputConns) {
           if (!conns) continue;
           for (const conn of conns) {
-            if (conn) connectedNodes.add(conn.node);
+            if (conn) {
+              connectedNodes.add(conn.node);
+              hasTarget = true;
+            }
           }
         }
       }
+      if (hasTarget) connectedNodes.add(sourceName);
     }
 
     for (const node of workflow.nodes) {
@@ -1331,11 +1888,11 @@ export class WorkflowValidator {
     workflow: WorkflowJson,
     result: WorkflowValidationResult
   ): void {
-    // Build adjacency list (forward direction)
+    // Build adjacency list (forward direction, plus reverse for ai_* edges)
     const adjacency = new Map<string, Set<string>>();
     for (const [sourceName, outputs] of Object.entries(workflow.connections)) {
       if (!adjacency.has(sourceName)) adjacency.set(sourceName, new Set());
-      for (const outputConns of Object.values(outputs)) {
+      for (const [connectionType, outputConns] of Object.entries(outputs)) {
         if (Array.isArray(outputConns)) {
           for (const conns of outputConns) {
             if (!conns) continue;
@@ -1344,6 +1901,12 @@ export class WorkflowValidator {
                 adjacency.get(sourceName)!.add(conn.node);
                 // Also track that the target exists in the graph
                 if (!adjacency.has(conn.node)) adjacency.set(conn.node, new Set());
+                // AI connections are stored sub-node -> parent, so a reachable
+                // parent must make its attached sub-nodes (model/memory/tool/
+                // parser chains) reachable: traverse ai_* edges in reverse too.
+                if (connectionType.startsWith('ai_')) {
+                  adjacency.get(conn.node)!.add(sourceName);
+                }
               }
             }
           }
@@ -1366,12 +1929,12 @@ export class WorkflowValidator {
     }
 
     // BFS from all trigger nodes
-    const reachable = new Set<string>();
-    const queue: string[] = [...triggerNodes];
-    for (const t of triggerNodes) reachable.add(t);
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): each name is queued once and read by index
+    const reachable = new Set<string>(triggerNodes);
+    const queue: string[] = [...reachable];
 
-    while (queue.length > 0) {
-      const current = queue.shift()!;
+    for (let head = 0; head < queue.length; head++) {
+      const current = queue[head];
       const neighbors = adjacency.get(current);
       if (neighbors) {
         for (const neighbor of neighbors) {
@@ -1400,21 +1963,30 @@ export class WorkflowValidator {
   }
 
   /**
-   * Check if workflow has cycles
-   * Allow legitimate loops for SplitInBatches and similar loop nodes
+   * Check if workflow has cycles with no recognized exit mechanism.
+   * A cycle is allowed when ANY node ON the cycle can route items out of it:
+   * loop nodes (SplitInBatches etc.), conditional routers (IF/Switch/Filter/
+   * multi-output langchain routers like textClassifier), nodes with an error
+   * output configured, or nodes with multiple wired main outputs.
    */
   private hasCycle(workflow: WorkflowJson): boolean {
     const visited = new Set<string>();
-    const recursionStack = new Set<string>();
+    // Position of each node on the current DFS path
+    const pathPosition = new Map<string, number>();
+    const path: string[] = [];
+    // exitCounts[k]: potential cycle exits among path[0..k-1], filled on demand
+    const exitCounts: number[] = [0];
     const nodeTypeMap = new Map<string, string>();
-    
-    // Build node type map (exclude sticky notes)
+    const nodeMap = new Map<string, WorkflowNode>();
+
+    // Build node maps (exclude sticky notes)
     workflow.nodes.forEach(node => {
       if (!isNonExecutableNode(node.type)) {
         nodeTypeMap.set(node.name, node.type);
+        nodeMap.set(node.name, node);
       }
     });
-    
+
     // Known legitimate loop node types
     const loopNodeTypes = [
       'n8n-nodes-base.splitInBatches',
@@ -1433,11 +2005,50 @@ export class WorkflowValidator {
       'nodes-base.switch',
       'n8n-nodes-base.filter',
       'nodes-base.filter',
+      // Multi-output langchain routers
+      '@n8n/n8n-nodes-langchain.textClassifier',
+      'n8n-nodes-langchain.textClassifier',
+      'nodes-langchain.textClassifier',
     ];
 
-    const hasCycleDFS = (nodeName: string, pathFromLoopNode: boolean = false, pathFromConditionalNode: boolean = false): boolean => {
+    const isPotentialCycleExit = (nodeName: string): boolean => {
+      const nodeType = nodeTypeMap.get(nodeName) || '';
+      if (loopNodeTypes.includes(nodeType) || conditionalNodeTypes.includes(nodeType)) {
+        return true;
+      }
+
+      const node = nodeMap.get(nodeName);
+      // A configured error output routes failed items out of the loop
+      if (node?.onError === 'continueErrorOutput') return true;
+
+      // Multiple wired main outputs = the node can route items out of the
+      // cycle (covers community/langchain dual-output poll and router nodes)
+      const connections = workflow.connections[nodeName];
+      const mainOutputs = connections?.main;
+      if (Array.isArray(mainOutputs)) {
+        const wiredOutputs = mainOutputs.filter(conns => Array.isArray(conns) && conns.length > 0).length;
+        if (wiredOutputs > 1) return true;
+      }
+
+      // Nodes whose description declares multiple natural main outputs
+      const outputCount = node ? this.getMainOutputCount(node) : null;
+      return outputCount !== null && outputCount > 1;
+    };
+
+    // Whether any node on the current path from position `start` onwards is a potential exit
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): exit counts along the current path
+    const pathFromHasExit = (start: number): boolean => {
+      while (exitCounts.length <= path.length) {
+        const k = exitCounts.length - 1;
+        exitCounts.push(exitCounts[k] + (isPotentialCycleExit(path[k]) ? 1 : 0));
+      }
+      return exitCounts[path.length] > exitCounts[start];
+    };
+
+    const hasCycleDFS = (nodeName: string): boolean => {
       visited.add(nodeName);
-      recursionStack.add(nodeName);
+      pathPosition.set(nodeName, path.length);
+      path.push(nodeName);
 
       const connections = workflow.connections[nodeName];
       if (connections) {
@@ -1451,29 +2062,23 @@ export class WorkflowValidator {
           }
         }
 
-        const currentNodeType = nodeTypeMap.get(nodeName);
-        const isLoopNode = loopNodeTypes.includes(currentNodeType || '');
-        const isConditionalNode = conditionalNodeTypes.includes(currentNodeType || '');
-
         for (const target of allTargets) {
           if (!visited.has(target)) {
-            if (hasCycleDFS(target, pathFromLoopNode || isLoopNode, pathFromConditionalNode || isConditionalNode)) return true;
-          } else if (recursionStack.has(target)) {
-            // Allow cycles that involve legitimate loop nodes
-            const targetNodeType = nodeTypeMap.get(target);
-            const isTargetLoopNode = loopNodeTypes.includes(targetNodeType || '');
-
-            // Allow cycles involving loop nodes or conditional exit nodes (IF/Switch/Filter)
-            if (isTargetLoopNode || pathFromLoopNode || isLoopNode || pathFromConditionalNode || isConditionalNode) {
-              continue; // Allow this cycle
+            if (hasCycleDFS(target)) return true;
+          } else if (pathPosition.has(target)) {
+            // Back edge found: the cycle is the current path segment from the
+            // target onwards. Evaluate the exit condition over the WHOLE
+            // cycle, not just the nodes on the first DFS path into it.
+            if (!pathFromHasExit(pathPosition.get(target)!)) {
+              return true; // No exit mechanism anywhere on the cycle
             }
-
-            return true; // Reject other cycles
           }
         }
       }
 
-      recursionStack.delete(nodeName);
+      pathPosition.delete(nodeName);
+      path.pop();
+      if (exitCounts.length > path.length + 1) exitCounts.length = path.length + 1;
       return false;
     };
 
@@ -1495,7 +2100,8 @@ export class WorkflowValidator {
     result: WorkflowValidationResult,
     profile: string = 'runtime'
   ): void {
-    const nodeNames = workflow.nodes.map(n => n.name);
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): one name set shared by every node's expression context
+    const nodeNameSet = new Set(workflow.nodes.map(n => n.name));
 
     for (const node of workflow.nodes) {
       if (node.disabled || isNonExecutableNode(node.type)) continue;
@@ -1509,7 +2115,7 @@ export class WorkflowValidator {
 
       // Create expression context
       const context = {
-        availableNodes: nodeNames.filter(n => n !== node.name),
+        availableNodes: { has: (name: string) => name !== node.name && nodeNameSet.has(name) },
         currentNodeName: node.name,
         hasInputData: this.nodeHasInput(node.name, workflow),
         isInLoop: false // Could be enhanced to detect loop nodes
@@ -1551,20 +2157,16 @@ export class WorkflowValidator {
         nodeId: node.id
       };
 
+      // The validator gates the missing-cachedResultName advisory by profile
+      // (ai-friendly/strict only) — it is UI-guidance, not runtime-blocking (#715).
       const formatIssues = ExpressionFormatValidator.validateNodeParameters(
         node.parameters,
-        formatContext
+        formatContext,
+        profile as ValidationProfile
       );
 
-      // Suppress missing-cachedResultName warnings at minimal profile only
-      // — the issue is UI-degrading, not runtime-blocking, so callers asking
-      // for the smallest possible result set don't need it (#715).
-      const filteredIssues = profile === 'minimal'
-        ? formatIssues.filter(i => i.issueType !== 'missing-cached-result-name')
-        : formatIssues;
-
       // Add format errors and warnings
-      filteredIssues.forEach(issue => {
+      formatIssues.forEach(issue => {
         const formattedMessage = ExpressionFormatValidator.formatErrorMessage(issue, formatContext);
 
         if (issue.severity === 'error') {
@@ -1616,16 +2218,19 @@ export class WorkflowValidator {
    * Check if a node has input connections
    */
   private nodeHasInput(nodeName: string, workflow: WorkflowJson): boolean {
-    for (const [sourceName, outputs] of Object.entries(workflow.connections)) {
-      if (outputs.main) {
-        for (const outputConnections of outputs.main) {
-          if (outputConnections?.some(conn => conn.node === nodeName)) {
-            return true;
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): collect main-input targets once per workflow
+    if (this.mainInputTargets?.workflow !== workflow) {
+      const targets = new Set<string>();
+      for (const outputs of Object.values(workflow.connections)) {
+        if (outputs.main) {
+          for (const outputConnections of outputs.main) {
+            outputConnections?.forEach(conn => targets.add(conn.node));
           }
         }
       }
+      this.mainInputTargets = { workflow, targets };
     }
-    return false;
+    return this.mainInputTargets.targets.has(nodeName);
   }
 
   /**
@@ -1636,33 +2241,32 @@ export class WorkflowValidator {
     result: WorkflowValidationResult,
     profile: string = 'runtime'
   ): void {
-    // Check for error handling (n8n uses main[1] for error outputs, not outputs.error)
-    const hasErrorHandling = Object.values(workflow.connections).some(
-      outputs => outputs.main && outputs.main.length > 1 && outputs.main[1] && outputs.main[1].length > 0
-    );
+    const advisoryProfile = this.isAdvisoryProfile(profile);
 
-    // Only suggest error handling in stricter profiles
-    if (!hasErrorHandling && workflow.nodes.length > 3 && profile !== 'minimal') {
+    // Missing error handling is advisory (fail-loud defaults are a valid
+    // choice), so it only surfaces in the advisory profiles.
+    if (advisoryProfile && workflow.nodes.length > 3 && !this.workflowHasErrorHandling(workflow)) {
       result.warnings.push({
         type: 'warning',
-        message: 'Consider adding error handling to your workflow'
+        message: ADD_ERROR_HANDLING_ADVISORY
       });
     }
 
     // Check node-level error handling properties for ALL executable nodes
     for (const node of workflow.nodes) {
       if (!isNonExecutableNode(node.type)) {
-        this.checkNodeErrorHandling(node, workflow, result);
+        this.checkNodeErrorHandling(node, workflow, result, profile);
       }
     }
 
-    // Check for very long linear workflows
-    const linearChainLength = this.getLongestLinearChain(workflow);
-    if (linearChainLength > 10) {
-      result.warnings.push({
-        type: 'warning',
-        message: `Long linear chain detected (${linearChainLength} nodes). Consider breaking into sub-workflows.`
-      });
+    // Check for very long linear workflows (maintainability note only)
+    if (advisoryProfile) {
+      const linearChainLength = this.getLongestLinearChain(workflow);
+      if (linearChainLength > 10) {
+        result.suggestions.push(
+          `Long linear chain detected (${linearChainLength} nodes). Consider breaking into sub-workflows.`
+        );
+      }
     }
 
     // Generate error handling suggestions based on all nodes
@@ -1684,34 +2288,66 @@ export class WorkflowValidator {
       }
     }
 
-    // Check for AI Agent workflows
-    const aiAgentNodes = workflow.nodes.filter(n =>
-      n.type.toLowerCase().includes('agent') ||
-      n.type.includes('langchain.agent')
-    );
+    // AI Agent advisories (no tools connected, community tools) are covered
+    // by validateAISpecificNodes (exact agent type match, node name in the
+    // message) and by validateAIToolSource (per-node community-package
+    // notice) — no duplicate workflow-level checks here.
+  }
 
-    if (aiAgentNodes.length > 0) {
-      // Check if AI agents have tools connected
-      // Tools connect TO the agent, so we need to find connections where the target is the agent
-      for (const agentNode of aiAgentNodes) {
-        // Search all connections to find ones targeting this agent via ai_tool
-        const hasToolConnected = Object.values(workflow.connections).some(sourceOutputs => {
-          const aiToolConnections = sourceOutputs.ai_tool;
-          if (!aiToolConnections) return false;
-          return aiToolConnections.flat().some(conn => conn && conn.node === agentNode.name);
-        });
+  /**
+   * Whether the workflow has any error handling: a node-level error strategy
+   * (onError/continueOnFail/retryOnFail), an Error Trigger, or a wired error
+   * output. n8n stores wired error outputs at main[naturalOutputCount] and
+   * never under a top-level `error` connection key.
+   */
+  private workflowHasErrorHandling(workflow: WorkflowJson): boolean {
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): whether a node name has any wired main output, per name
+    const hasWiredMainOutput = new Map<string, boolean>();
+    return workflow.nodes.some(node => {
+      if (node.disabled) return false;
+      if (node.type.toLowerCase().includes('errortrigger')) return true;
+      if (node.continueOnFail === true || node.retryOnFail === true) return true;
+      // 'stopWorkflow' is n8n's default fail behavior — setting it explicitly is
+      // not error handling and must not suppress the workflow-level advisory.
+      if (node.onError === undefined || node.onError === 'stopWorkflow') return false;
+      if (node.onError !== 'continueErrorOutput') return true;
 
-        if (!hasToolConnected) {
-          result.warnings.push({
-            type: 'warning',
-            nodeId: agentNode.id,
-            nodeName: agentNode.name,
-            message: 'AI Agent has no tools connected. Consider adding tools to enhance agent capabilities.'
-          });
+      // continueErrorOutput only routes failures somewhere when the error
+      // output is actually wired
+      const mainOutputs = workflow.connections[node.name]?.main;
+      if (!Array.isArray(mainOutputs)) return false;
+      const errorOutputIndex = this.getMainOutputCount(node);
+      if (errorOutputIndex === null) {
+        let wired = hasWiredMainOutput.get(node.name);
+        if (wired === undefined) {
+          wired = mainOutputs.some(conns => Array.isArray(conns) && conns.length > 0);
+          hasWiredMainOutput.set(node.name, wired);
         }
+        return wired;
       }
-      
+      const errorConnections = mainOutputs[errorOutputIndex];
+      return Array.isArray(errorConnections) && errorConnections.length > 0;
+    });
+  }
+
+  /**
+   * Whether the node ever executes on a main branch. AI sub-nodes (ai_*-only
+   * outputs) and Tool variants run inside an agent's slots, so node-level
+   * error-handling advisories (onError etc.) do not apply to them.
+   */
+  private nodeExecutesOnMainBranch(node: WorkflowNode): boolean {
+    const normalizedType = NodeTypeNormalizer.normalizeToFullForm(node.type);
+    if (isAIToolSubNode(normalizedType) || ToolVariantGenerator.isToolVariantNodeType(normalizedType)) {
+      return false;
     }
+
+    const nodeInfo = this.nodeRepository.getNode(normalizedType);
+    if (nodeInfo?.isToolVariant) return false;
+    if (!nodeInfo || nodeInfo.outputs == null) return true; // Unknown node — assume main
+    if (!Array.isArray(nodeInfo.outputs)) return true; // Dynamic outputs expression
+    return nodeInfo.outputs.some((o: any) =>
+      typeof o === 'string' ? o === 'main' : (o.type === 'main' || !o.type)
+    );
   }
 
   /**
@@ -1765,7 +2401,8 @@ export class WorkflowValidator {
    */
   private generateSuggestions(
     workflow: WorkflowJson,
-    result: WorkflowValidationResult
+    result: WorkflowValidationResult,
+    profile: string = 'runtime'
   ): void {
     // Suggest adding trigger if missing
     if (result.statistics.triggerNodes === 0) {
@@ -1792,8 +2429,16 @@ export class WorkflowValidator {
       );
     }
 
-    // Suggest error handling
-    if (!Object.values(workflow.connections).some(o => o.error)) {
+    // Suggest error handling. Skip when checkWorkflowPatterns already warned
+    // about the same gap (advisory profiles) so a workflow gets the advice once.
+    const alreadyWarnedAboutErrorHandling = result.warnings.some(
+      w => w.message === ADD_ERROR_HANDLING_ADVISORY
+    );
+    if (
+      profile !== 'minimal' &&
+      !alreadyWarnedAboutErrorHandling &&
+      !this.workflowHasErrorHandling(workflow)
+    ) {
       result.suggestions.push(
         'Add error handling using the error output of nodes or an Error Trigger node'
       );
@@ -1803,19 +2448,6 @@ export class WorkflowValidator {
     if (workflow.nodes.length > 20) {
       result.suggestions.push(
         'Consider breaking this workflow into smaller sub-workflows for better maintainability'
-      );
-    }
-
-    // Suggest using Code node for complex logic
-    const complexExpressionNodes = workflow.nodes.filter(node => {
-      const jsonString = JSON.stringify(node.parameters);
-      const expressionCount = (jsonString.match(/\{\{/g) || []).length;
-      return expressionCount > 5;
-    });
-
-    if (complexExpressionNodes.length > 0) {
-      result.suggestions.push(
-        'Consider using a Code node for complex data transformations instead of multiple expressions'
       );
     }
 
@@ -1838,11 +2470,13 @@ export class WorkflowValidator {
    * @param node - The workflow node to validate
    * @param workflow - The complete workflow for context
    * @param result - Validation result to add errors/warnings to
+   * @param profile - Validation profile (advisory warnings fire only under ai-friendly/strict)
    */
   private checkNodeErrorHandling(
     node: WorkflowNode,
     workflow: WorkflowJson,
-    result: WorkflowValidationResult
+    result: WorkflowValidationResult,
+    profile: string = 'runtime'
   ): void {
     // Only skip if disabled is explicitly true (not just truthy)
     if (node.disabled === true) return;
@@ -1976,7 +2610,8 @@ export class WorkflowValidator {
           });
         }
 
-        // If retry is enabled, check retry configuration
+        // If retry is enabled, check retry configuration. An absent maxTries
+        // simply means the documented default of 3 — not worth a finding.
         if (node.retryOnFail === true) {
           if (node.maxTries !== undefined) {
             if (typeof node.maxTries !== 'number' || node.maxTries < 1) {
@@ -1994,14 +2629,6 @@ export class WorkflowValidator {
                 message: `maxTries is set to ${node.maxTries}. Consider if this many retries is necessary.`
               });
             }
-          } else {
-            // maxTries defaults to 3 if not specified
-            result.warnings.push({
-              type: 'warning',
-              nodeId: node.id,
-              nodeName: node.name,
-              message: 'retryOnFail is enabled but maxTries is not specified. Default is 3 attempts.'
-            });
           }
 
           if (node.waitBetweenTries !== undefined) {
@@ -2033,23 +2660,34 @@ export class WorkflowValidator {
         });
     }
 
-    // Warnings for error-prone nodes without error handling
-    const hasErrorHandling = node.onError || node.continueOnFail || node.retryOnFail;
-    
-    if (isErrorProne && !hasErrorHandling) {
+    // Advisory warnings for error-prone nodes without error handling.
+    // Fail-loud defaults are a valid choice, so these only fire in the
+    // advisory profiles. onError applies to main-branch execution only, so
+    // AI sub-nodes/Tool variants (no main output) and non-webhook triggers
+    // are skipped. The branches are exclusive: one warning per node at most.
+    // onError: 'stopWorkflow' is n8n's fail-loud default, not error handling
+    // (consistent with workflowHasErrorHandling)
+    const hasErrorHandling = (node.onError && node.onError !== 'stopWorkflow') ||
+      node.continueOnFail || node.retryOnFail;
+    const advisoryProfile = this.isAdvisoryProfile(profile);
+
+    if (isErrorProne && !hasErrorHandling && advisoryProfile) {
         const nodeTypeSimple = normalizedType.split('.').pop() || normalizedType;
-        
+
         // Special handling for specific node types
-        if (normalizedType.includes('httprequest')) {
+        if (normalizedType.includes('webhook')) {
+          // Delegate to specialized webhook validation helper (webhooks are
+          // triggers, so this must run before the trigger skip below)
+          this.checkWebhookErrorHandling(node, normalizedType, result);
+        } else if (!this.nodeExecutesOnMainBranch(node) || isTriggerNode(node.type)) {
+          // onError is meaningless here — no advisory
+        } else if (normalizedType.includes('httprequest')) {
           result.warnings.push({
             type: 'warning',
             nodeId: node.id,
             nodeName: node.name,
             message: 'HTTP Request node without error handling. Consider adding "onError: \'continueRegularOutput\'" for non-critical requests or "retryOnFail: true" for transient failures.'
           });
-        } else if (normalizedType.includes('webhook')) {
-          // Delegate to specialized webhook validation helper
-          this.checkWebhookErrorHandling(node, normalizedType, result);
         } else if (errorProneNodeTypes.some(db => normalizedType.includes(db) && ['postgres', 'mysql', 'mongodb'].includes(db))) {
           result.warnings.push({
             type: 'warning',
@@ -2067,14 +2705,11 @@ export class WorkflowValidator {
         }
     }
 
-    // Check for problematic combinations
+    // Informational: both flags together is a defined, benign combination
     if (node.continueOnFail && node.retryOnFail) {
-        result.warnings.push({
-          type: 'warning',
-          nodeId: node.id,
-          nodeName: node.name,
-          message: 'Both continueOnFail and retryOnFail are enabled. The node will retry first, then continue on failure.'
-        });
+        result.suggestions.push(
+          `Node "${node.name}": both continueOnFail and retryOnFail are enabled. The node will retry first, then continue on failure.`
+        );
     }
 
     // Validate additional node-level properties
@@ -2143,9 +2778,10 @@ export class WorkflowValidator {
   /**
    * Check webhook-specific error handling requirements
    *
-   * Webhooks have special error handling requirements:
+   * Webhooks have special error handling behavior:
    * - respondToWebhook nodes (response nodes) don't need error handling
-   * - Webhook nodes with responseNode mode REQUIRE onError to ensure responses
+   * - Webhook nodes with responseNode mode need nothing: n8n auto-returns 500
+   *   when the workflow errors before the Respond to Webhook node
    * - Regular webhook nodes should have error handling to prevent blocking
    *
    * @param node - The webhook node to check
@@ -2163,17 +2799,10 @@ export class WorkflowValidator {
       return;
     }
 
-    // Check for responseNode mode specifically
-    // responseNode mode requires onError to ensure response is sent even on error
+    // responseNode mode needs no onError: n8n automatically returns a 500 if
+    // the workflow errors before a Respond to Webhook node executes, and
+    // onError on the trigger has no effect on downstream failures.
     if (node.parameters?.responseMode === 'responseNode') {
-      if (!node.onError && !node.continueOnFail) {
-        result.errors.push({
-          type: 'error',
-          nodeId: node.id,
-          nodeName: node.name,
-          message: 'responseNode mode requires onError: "continueRegularOutput"'
-        });
-      }
       return;
     }
 
@@ -2217,6 +2846,18 @@ export class WorkflowValidator {
   }
 
   /**
+   * Lower-cased node type and name, computed once per node per validation
+   */
+  private lowerCaseNodeNames(node: WorkflowNode): { type: string; name: string } {
+    let names = this.lowerCaseNames.get(node);
+    if (!names) {
+      names = { type: node.type.toLowerCase(), name: node.name.toLowerCase() };
+      this.lowerCaseNames.set(node, names);
+    }
+    return names;
+  }
+
+  /**
    * Validate SplitInBatches node connections for common mistakes
    */
   private validateSplitInBatchesConnection(
@@ -2235,8 +2876,7 @@ export class WorkflowValidator {
     if (outputIndex === 0) {
       // This is the "done" output (index 0)
       // Check if target looks like it should be in the loop
-      const targetType = targetNode.type.toLowerCase();
-      const targetName = targetNode.name.toLowerCase();
+      const { type: targetType, name: targetName } = this.lowerCaseNodeNames(targetNode);
       
       // Common patterns that suggest this node should be inside the loop
       if (targetType.includes('function') || 
@@ -2249,7 +2889,9 @@ export class WorkflowValidator {
         // Check if this node connects back to the SplitInBatches
         const hasLoopBack = this.checkForLoopBack(targetNode.name, sourceNode.name, nodeMap);
         
-        if (hasLoopBack) {
+        if (hasLoopBack === null) {
+          this.reportIncompleteLoopBackCheck(result);
+        } else if (hasLoopBack) {
           result.errors.push({
             type: 'error',
             nodeId: sourceNode.id,
@@ -2268,8 +2910,7 @@ export class WorkflowValidator {
     } else if (outputIndex === 1) {
       // This is the "loop" output (index 1)
       // Check if target looks like it should be after the loop
-      const targetType = targetNode.type.toLowerCase();
-      const targetName = targetNode.name.toLowerCase();
+      const { type: targetType, name: targetName } = this.lowerCaseNodeNames(targetNode);
       
       // Common patterns that suggest this node should be after the loop
       if (targetType.includes('aggregate') ||
@@ -2291,7 +2932,9 @@ export class WorkflowValidator {
       
       // Check if loop output doesn't eventually connect back
       const hasLoopBack = this.checkForLoopBack(targetNode.name, sourceNode.name, nodeMap);
-      if (!hasLoopBack) {
+      if (hasLoopBack === null) {
+        this.reportIncompleteLoopBackCheck(result);
+      } else if (!hasLoopBack) {
         result.warnings.push({
           type: 'warning',
           nodeId: sourceNode.id,
@@ -2303,47 +2946,77 @@ export class WorkflowValidator {
   }
 
   /**
-   * Check if a node eventually connects back to a target node
+   * Check if a node eventually connects back to a target node.
+   * Returns null when the step budget ran out before the answer was known.
    */
   private checkForLoopBack(
     startNode: string,
     targetNode: string,
+    nodeMap: Map<string, WorkflowNode>
+  ): boolean | null {
+    // SECURITY (GHSA-xvxq-x6hr-xc2c): reuse reachability per start node, with a step budget
+    let entry = this.loopBackReach.get(startNode);
+    if (!entry) {
+      const reached = new Set<string>();
+      const complete = this.collectLoopBackReach(startNode, nodeMap, new Set(), 50, reached);
+      entry = { reached, complete };
+      this.loopBackReach.set(startNode, entry);
+    }
+    if (entry.reached.has(targetNode)) return true;
+    return entry.complete ? false : null;
+  }
+
+  /**
+   * Collect every node name a depth-first walk from startNode reaches through
+   * connections, up to maxDepth levels. Returns false if the step budget ran out,
+   * leaving `reached` holding the part of the walk done so far.
+   */
+  private collectLoopBackReach(
+    startNode: string,
     nodeMap: Map<string, WorkflowNode>,
-    visited: Set<string> = new Set(),
-    maxDepth: number = 50
+    visited: Set<string>,
+    maxDepth: number,
+    reached: Set<string>
   ): boolean {
-    if (maxDepth <= 0) return false; // Prevent stack overflow
-    if (visited.has(startNode)) return false;
+    if (maxDepth <= 0) return true; // Prevent stack overflow
+    if (visited.has(startNode)) return true;
     visited.add(startNode);
 
     const node = nodeMap.get(startNode);
-    if (!node) return false;
+    if (!node) return true;
 
-    // Access connections from the workflow structure, not the node
-    // We need to access this.currentWorkflow.connections[startNode]
-    const connections = (this as any).currentWorkflow?.connections[startNode];
-    if (!connections) return false;
+    const connections = this.currentWorkflow?.connections[startNode];
+    if (!connections) return true;
+    if (this.loopBackSteps <= 0) return false;
 
-    for (const [outputType, outputs] of Object.entries(connections)) {
+    for (const outputs of Object.values(connections)) {
+      if (--this.loopBackSteps < 0) return false;
       if (!Array.isArray(outputs)) continue;
-      
+
       for (const outputConnections of outputs) {
+        if (--this.loopBackSteps < 0) return false;
         if (!Array.isArray(outputConnections)) continue;
-        
+
         for (const conn of outputConnections) {
-          if (conn.node === targetNode) {
-            return true;
-          }
-          
-          // Recursively check connected nodes
-          if (this.checkForLoopBack(conn.node, targetNode, nodeMap, visited, maxDepth - 1)) {
-            return true;
-          }
+          if (--this.loopBackSteps < 0) return false;
+          reached.add(conn.node);
+          if (!this.collectLoopBackReach(conn.node, nodeMap, visited, maxDepth - 1, reached)) return false;
         }
       }
     }
+    return true;
+  }
 
-    return false;
+  /**
+   * Add one workflow-level warning when a loop-back check could not be completed
+   */
+  private reportIncompleteLoopBackCheck(result: WorkflowValidationResult): void {
+    if (this.loopBackIncompleteReported) return;
+    this.loopBackIncompleteReported = true;
+    result.warnings.push({
+      type: 'warning',
+      message: 'The workflow\'s loop structure is too large to check fully. Some SplitInBatches loop-back checks were skipped.'
+    });
   }
 
   /**
@@ -2390,8 +3063,8 @@ export class WorkflowValidator {
     if (errorTypes.configuration.length > 0) {
       result.suggestions.unshift(
         '🔧 RECOVERY: Node configuration errors. Fix with:',
-        '   • Check required fields using validate_node_minimal first',
-        '   • Use get_node_essentials to see what fields are needed',
+        "   • Check required fields using validate_node with mode='minimal' first",
+        '   • Use get_node to see what fields are needed',
         '   • Ensure operation-specific fields match the node\'s requirements'
       );
     }
@@ -2400,7 +3073,7 @@ export class WorkflowValidator {
       result.suggestions.unshift(
         '🔧 RECOVERY: TypeVersion errors. Fix with:',
         '   • Add "typeVersion": 1 (or latest version) to each node',
-        '   • Use get_node_info to check the correct version for each node type'
+        '   • Use get_node to check the correct version for each node type'
       );
     }
 
@@ -2412,7 +3085,7 @@ export class WorkflowValidator {
         '   2. Validate node types and fix invalid ones',
         '   3. Add required typeVersion to all nodes',
         '   4. Test connections step by step',
-        '   5. Use validate_node_minimal on individual nodes to verify configuration'
+        "   5. Use validate_node with mode='minimal' on individual nodes to verify configuration"
       );
     }
   }
