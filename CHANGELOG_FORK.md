@@ -39,12 +39,26 @@ Versioning: `v<upstream-version>-chatwoot.<n>` where:
   Used for `@renatoascencio/n8n-nodes-evolution-api`, so `search_nodes`, `get_node` and `validate_workflow`
   know the node.
 
+### Fixed
+
+- **`n8n_move_workflow` / `n8n_create_folder` with `parentFolderId: null`**. n8n 2.45 answers HTTP 400 (its DTOs
+  take a string or no field), and on 2.38 the `null` was silently ignored, so nothing moved. Moving to the
+  project root now sends the root id `"0"` and creating at the root omits the field
+  (`buildMoveWorkflowPayload`, `buildCreateFolderPayload`).
+
 ### Compatibility checked
 
-- n8n 2.45.7 (current stable): the internal REST endpoints the fork uses (`POST /rest/login` with
-  `emailOrLdapLoginId` and `mfaCode`, `POST /rest/projects/:id/folders`, `PATCH /rest/workflows/:id` with only
-  `parentFolderId`) are unchanged, and the public API differs from 2.44.5 only by additions (the schemas are
-  identical). Upstream's own contract check stops at 2.44.5.
+- **Live n8n 2.45.7** (real container, owner + API key) against the published image: `n8n_health_check`,
+  `n8n_create_workflow` (Webhook 2.1, IF 2.3), `n8n_get_workflow`, `n8n_validate_workflow` (0 errors),
+  `n8n_update_partial_workflow`, `n8n_list_workflows`, `n8n_delete_workflow`, `n8n_login` and
+  `n8n_move_workflow` all work. `n8n_create_folder` answers 403 "Plan lacks license for this feature" on an
+  unregistered community instance; n8n 2.38.7 gates folders by the same `feat:folders` license.
+- `@renatoascencio/n8n-nodes-chatwoot` 0.9.0 and `@renatoascencio/n8n-nodes-evolution-api` 0.1.0 install and
+  load in n8n 2.45.7; the six node types it serves (main, Tool and Trigger of each) are the ones registered in
+  `data/nodes.db`.
+- The MCP blocks private hosts for `N8N_API_URL` (SSRF protection, `WEBHOOK_SECURITY_MODE`): an internal
+  hostname such as a Docker/EasyPanel service name needs `WEBHOOK_SECURITY_MODE=permissive`; a public URL does not.
+- The public API of 2.45.7 differs from 2.44.5 only by additions (the schemas are identical).
 
 ## [Unreleased] - Chatwoot node 0.9.0
 

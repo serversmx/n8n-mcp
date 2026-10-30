@@ -114,10 +114,30 @@ async function authenticatedClient(baseUrl: string): Promise<AxiosInstance> {
   return buildClient(normalized, cookie);
 }
 
+/** n8n's id for the project root (PROJECT_ROOT in n8n-workflow). */
+const PROJECT_ROOT = '0';
+
+/**
+ * n8n's folder DTOs take `parentFolderId` as a string or omit it; `null` is rejected with HTTP 400 since
+ * 2.4x (verified on 2.45.7). Creating at the project root means omitting the field.
+ */
+export function buildCreateFolderPayload(input: Pick<N8nRestFolderInput, 'name' | 'parentFolderId'>): Record<string, unknown> {
+  const payload: Record<string, unknown> = { name: input.name };
+  if (input.parentFolderId) payload.parentFolderId = input.parentFolderId;
+  return payload;
+}
+
+/**
+ * Moving a workflow to the project root needs the explicit root id: `null` is a 400 on n8n 2.45 and was
+ * silently ignored (nothing moved) on 2.38, while '0' is understood by both.
+ */
+export function buildMoveWorkflowPayload(input: Pick<N8nRestMoveWorkflowInput, 'parentFolderId'>): { parentFolderId: string } {
+  return { parentFolderId: input.parentFolderId ?? PROJECT_ROOT };
+}
+
 export async function n8nRestCreateFolder(input: N8nRestFolderInput): Promise<any> {
   const client = await authenticatedClient(input.baseUrl);
-  const payload: Record<string, unknown> = { name: input.name };
-  if (input.parentFolderId !== undefined) payload.parentFolderId = input.parentFolderId;
+  const payload = buildCreateFolderPayload(input);
 
   const res = await client.post(`/rest/projects/${encodeURIComponent(input.projectId)}/folders`, payload);
   if (res.status >= 400) {
@@ -130,7 +150,7 @@ export async function n8nRestMoveWorkflow(input: N8nRestMoveWorkflowInput): Prom
   const client = await authenticatedClient(input.baseUrl);
   const res = await client.patch(
     `/rest/workflows/${encodeURIComponent(input.workflowId)}`,
-    { parentFolderId: input.parentFolderId }
+    buildMoveWorkflowPayload(input)
   );
   if (res.status >= 400) {
     throw new Error(`Move workflow failed: HTTP ${res.status} — ${JSON.stringify(res.data)}`);

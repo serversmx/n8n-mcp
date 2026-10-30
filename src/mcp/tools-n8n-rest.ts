@@ -42,7 +42,7 @@ export const n8nRestTools: ToolDefinition[] = [
         name: { type: 'string', description: 'Folder name' },
         parentFolderId: {
           type: ['string', 'null'],
-          description: 'Optional parent folder ID. Omit or null for project root.',
+          description: 'Optional parent folder ID. Omit or null to create at the project root.',
         },
       },
       required: ['baseUrl', 'projectId', 'name'],
@@ -58,7 +58,7 @@ export const n8nRestTools: ToolDefinition[] = [
         workflowId: { type: 'string', description: 'Workflow ID to move' },
         parentFolderId: {
           type: ['string', 'null'],
-          description: 'Destination folder ID. Pass null to move the workflow to project root.',
+          description: 'Destination folder ID. Pass null (sent to n8n as the root id "0") to move the workflow to the project root.',
         },
       },
       required: ['baseUrl', 'workflowId', 'parentFolderId'],
