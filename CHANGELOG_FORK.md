@@ -9,6 +9,30 @@ Versioning: `v<upstream-version>-chatwoot.<n>` where:
 - `<upstream-version>` is the n8n-mcp version we synced from (e.g., `2.51.1`)
 - `<n>` is the iteration number for fork-specific changes on that base
 
+## [Unreleased] - n8n 2.45 catalog and automatic catalog sync
+
+### Changed
+
+- **Node catalog moved from n8n 2.44.x to 2.45.x**: n8n-nodes-base, n8n-core and @n8n/n8n-nodes-langchain
+  2.45.6, n8n-workflow 2.45.4 (the newest published of each; n8n latest is 2.45.7, production runs 2.45.5).
+  `data/nodes.db` was rebuilt: 3,150 nodes (one new core node, none removed), community nodes and templates
+  untouched, Chatwoot 0.9.0 and Evolution API 0.1.0 re-registered.
+- `src/mappers/docs-mapper.ts` also looks for `<node>/README.md`. The `n8n-docs` repo moved to the GitBook
+  layout, so a rebuild against it found `index.md` for almost nothing and dropped the core documentation from
+  713 to 0 nodes. With `README.md` it is 750 (37 nodes gained documentation, 1 lost it).
+
+### Added
+
+- **`.github/workflows/sync-n8n-catalog.yml`** (Mondays 06:23 UTC, or manually): when a new n8n minor is out it
+  rebuilds `data/nodes.db`, re-registers the fork nodes, runs `scripts/verify-nodes-db.js` and the unit suite,
+  then pushes `auto/n8n-catalog-<version>` and opens a PR. It never merges or deploys. Patch-only releases are
+  ignored (each resync adds ~70 MB of `nodes.db` to git history); run it manually with `include_patches` to force one.
+- `scripts/sync-n8n-catalog.js`: resolves the four n8n sub-package versions from the npm registry. Upstream's
+  `update-n8n-deps.js` reads them from `n8n@latest`'s `dependencies`, which n8n 2.x no longer lists, so it skips
+  every package. Refuses major changes and downgrades.
+- `scripts/verify-nodes-db.js`: fails the sync when a rebuild loses community nodes, templates, core
+  documentation, the FTS index or the fork's own packages.
+
 ## [Unreleased] - Sync with upstream v2.99.2 (n8n 2.44.x)
 
 ### Changed

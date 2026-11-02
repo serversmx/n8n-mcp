@@ -1,0 +1,153 @@
+name: Sync n8n catalog
+
+# Fork-specific. When a new n8n minor (X.Y) is out, rebuild data/nodes.db against it and open a PR.
+# It never merges and never deploys: merging to main publishes ghcr.io/serversmx/n8n-mcp:latest, and
+# redeploying `general_n8n-mcp` stays a manual step (see CLAUDE.md, "Redeploying").
+#
+# GITHUB_TOKEN pushes do not trigger other workflows, so this job runs the unit suite itself before it pushes.
+
+on:
+  schedule:
+    - cron: '23 6 * * 1' # Mondays, 06:23 UTC
+  workflow_dispatch:
+    inputs:
+      include_patches:
+        description: 'Also resync when only the patch version changed (adds ~70 MB of nodes.db to git history)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-n8n-catalog
+  cancel-in-progress: false
+
+env:
+  HUSKY: '0'
+
+jobs:
+  sync:
+    name: Rebuild catalog and open PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.4'
+          cache: npm
+
+      - name: Resolve target versions
+        id: resolve
+        env:
+          INCLUDE_PATCHES: ${{ inputs.include_patches }}
+        run: |
+          args=""
+          if [ "$INCLUDE_PATCHES" = "true" ]; then args="--include-patches"; fi
+          set +e
+          node scripts/sync-n8n-catalog.js $args
+          code=$?
+          set -e
+          if [ "$code" -eq 10 ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Catalog already in step with n8n latest." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$code" -ne 0 ]; then exit "$code"; fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if the branch already exists
+        id: branch
+        if: steps.resolve.outputs.changed == 'true'
+        env:
+          BRANCH: auto/n8n-catalog-${{ steps.resolve.outputs.catalog_version }}
+        run: |
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Branch $BRANCH already exists; nothing to do." >> "$GITHUB_STEP_SUMMARY"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch n8n-docs (node documentation source)
+        if: steps.branch.outputs.exists == 'false'
+        run: git clone --depth 1 https://github.com/n8n-io/n8n-docs.git n8n-docs
+
+      - name: Install dependencies
+        if: steps.branch.outputs.exists == 'false'
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: Build and rebuild the node database
+        if: steps.branch.outputs.exists == 'false'
+        run: |
+          npm run build
+          npm run rebuild
+
+      - name: Re-register the fork's Evolution package
+        if: steps.branch.outputs.exists == 'false'
+        run: |
+          # rebuild registers the Chatwoot nodes itself and keeps community rows; Evolution is registered from
+          # its published package so a new release is picked up too.
+          mkdir -p "$RUNNER_TEMP/evolution"
+          cd "$RUNNER_TEMP/evolution"
+          npm pack @renatoascencio/n8n-nodes-evolution-api@latest --silent
+          tar xzf ./*.tgz
+          cd "$GITHUB_WORKSPACE"
+          NODE_PATH="$GITHUB_WORKSPACE/node_modules" npm run register:community -- \
+            --package "$RUNNER_TEMP/evolution/package" \
+            --author-name "Renato Ascencio" \
+            --author-github-url https://github.com/RenatoAscencio
+
+      - name: Verify the rebuilt database
+        if: steps.branch.outputs.exists == 'false'
+        run: node scripts/verify-nodes-db.js
+
+      - name: Unit tests
+        if: steps.branch.outputs.exists == 'false'
+        run: npm run test:unit -- --coverage.enabled=false
+
+      - name: Commit and push
+        if: steps.branch.outputs.exists == 'false'
+        env:
+          BRANCH: ${{ steps.branch.outputs.name }}
+          N8N_VERSION: ${{ steps.resolve.outputs.n8n_version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add package.json package-lock.json Dockerfile README.md data/nodes.db
+          git commit -m "chore: sync n8n catalog to n8n $N8N_VERSION"
+          git push origin "$BRANCH"
+
+      - name: Open pull request
+        if: steps.branch.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          N8N_VERSION: ${{ steps.resolve.outputs.n8n_version }}
+          CATALOG_VERSION: ${{ steps.resolve.outputs.catalog_version }}
+          REPO: ${{ github.repository }}
+        run: |
+          cat > "$RUNNER_TEMP/body.md" <<EOF
+          Automated: n8n latest is **$N8N_VERSION**; the catalog (n8n-nodes-base, n8n-core, langchain, n8n-workflow) now follows **$CATALOG_VERSION**.
+
+          Done by the job before this PR: lockfile refreshed, \`data/nodes.db\` rebuilt with the \`n8n-docs\` documentation, Chatwoot and Evolution re-registered, \`scripts/verify-nodes-db.js\` and the full unit suite passed.
+
+          Not done (manual):
+          - Merging publishes \`ghcr.io/serversmx/n8n-mcp:latest\`; it does **not** redeploy \`general_n8n-mcp\` (recipe in CLAUDE.md, "Redeploying").
+          - If the new minor changed n8n's REST contract (\`/rest/login\`, folders, workflow PATCH), re-check it first (CLAUDE.md, "Syncing with upstream").
+          EOF
+          if ! gh pr create --base main --head "$BRANCH" \
+              --title "chore: sync n8n catalog to n8n $N8N_VERSION" --body-file "$RUNNER_TEMP/body.md"; then
+            {
+              echo "Branch \`$BRANCH\` was pushed but the PR could not be opened (enable *Allow GitHub Actions to create and approve pull requests* in Settings > Actions > General)."
+              echo "Open it by hand: https://github.com/$REPO/compare/main...$BRANCH?expand=1"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
