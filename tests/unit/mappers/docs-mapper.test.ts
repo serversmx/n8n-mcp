@@ -97,13 +97,18 @@ describe('DocsMapper', () => {
           .mockRejectedValueOnce(new Error('Not found')) // trigger-nodes direct
           .mockRejectedValueOnce(new Error('Not found')) // langchain root direct
           .mockRejectedValueOnce(new Error('Not found')) // langchain sub direct
+          .mockRejectedValueOnce(new Error('Not found')) // core-nodes directory/README.md
+          .mockRejectedValueOnce(new Error('Not found')) // app-nodes directory/README.md
+          .mockRejectedValueOnce(new Error('Not found')) // trigger-nodes directory/README.md
+          .mockRejectedValueOnce(new Error('Not found')) // langchain root directory/README.md
+          .mockRejectedValueOnce(new Error('Not found')) // langchain sub directory/README.md
           .mockResolvedValueOnce(mockContent); // Found in directory/index.md
 
         const result = await docsMapper.fetchDocumentation('complexNode');
 
         expect(result).toBe(mockContent);
         // Check that it eventually tried an index.md path
-        expect(fs.readFile).toHaveBeenCalledTimes(6);
+        expect(fs.readFile).toHaveBeenCalledTimes(11);
         const calls = vi.mocked(fs.readFile).mock.calls;
         const indexCalls = calls.filter(call => (call[0] as string).includes('index.md'));
         expect(indexCalls.length).toBeGreaterThan(0);
@@ -198,7 +203,7 @@ describe('DocsMapper', () => {
 
         expect(result).toBeNull();
         // Should have tried all possible paths
-        expect(fs.readFile).toHaveBeenCalledTimes(10); // 5 direct paths + 5 directory paths
+        expect(fs.readFile).toHaveBeenCalledTimes(15); // 5 direct paths + 5 README.md + 5 index.md directory paths
       });
 
       it('should handle non-Error exceptions', async () => {
