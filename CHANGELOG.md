@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.102.0] - 2026-11-09
+
+### Changed
+
+- **Updated n8n to 2.46.7.** n8n-nodes-base and @n8n/n8n-nodes-langchain → 2.46.7, n8n-core → 2.46.6, n8n-workflow → 2.46.5 (all from 2.46.4; n8n 2.46.7 is the npm `stable` release, 2.47.3 is `beta`). The upstream changes are bug fixes; the only node source change is the deprecation callout in AI Agent V1. Rebuilt the node database: 3,501 nodes (842 core: 708 from n8n-nodes-base, 134 from @n8n/n8n-nodes-langchain; 2,659 community, 2,228 verified). `node_versions` has 674 rows, as before. The community node refresh saved 104 node rows from 59 npm packages. 2,645 of 2,659 community nodes have an AI summary; the other 14 come from packages without a README. The database is 76.7 MiB.
+- **Removed the `@napi-rs` musl overrides.** n8n 2.46.6 moved the Linux musl builds of `@napi-rs/canvas` and `@napi-rs/image` back to optional platform packages (n8n-io/n8n#43035), so `npm install` works on macOS and glibc Linux without the empty-package stubs added in 2.101.0. The `isolated-vm` stub stays.
+- **n8n 2.46.7 contract check.** No changes between 2.46.4 and 2.46.7 in the Public API, the workflow settings, n8n's MCP server or the agent model provider tables.
+
+## [2.101.4] - 2026-11-07
+
+### Security
+
+- **Signed build provenance for releases.** Each GitHub release now includes `n8n-mcp-<version>.intoto.jsonl`, a signed SLSA provenance file for the MCPB bundle, produced by the SLSA generic generator. `SECURITY.md` explains how to verify it with `slsa-verifier`. npm packages were already published with npm provenance.
+- **CODEOWNERS.** The main branch rules already required a code-owner review; the repository now has the file that names the owner.
+
+## [2.101.3] - 2026-11-07
+
+### Security
+
+Hardening from the CodeQL security-extended review. None of these is a known vulnerability.
+
+- Telemetry sanitizers: `__proto__` keys are dropped instead of being written to a plain-object copy, where they would replace the copy's prototype. This covers node parameters, connections, the raw workflow path and nested event properties.
+- Logger: line breaks in logged strings are replaced with spaces, so a value from a request cannot start a forged log line, and the message is passed after a fixed `%s` format so text in it is never read as a format directive.
+- Release notes script: `git log` arguments are passed as a list instead of a shell command string.
+- The `/api` and `/rest` path checks behind the `responseFormat` suggestion are written as a single anchored group. Matching is unchanged.
+
+## [2.101.2] - 2026-11-07
+
+### Fixed
+
+- **The legacy Cron and Interval nodes count as triggers** ([#1050](https://github.com/czlonkowski/n8n-mcp/issues/1050)). Trigger detection matched node types by name, and `n8n-nodes-base.cron` and `n8n-nodes-base.interval` contain no "trigger" marker. An active workflow started by either node failed `n8n_update_partial_workflow` with "No activatable trigger nodes found", and `validate_workflow` reported zero trigger nodes for it. Contributed in #1057; Interval added in this release.
+- **`GET /mcp` keeps a StreamableHTTP session alive and returns 404 for an unknown session** ([#834](https://github.com/czlonkowski/n8n-mcp/issues/834)). Only `POST /mcp` refreshed a session's last-access time, so the idle-session cleanup could remove a session whose client was holding a `GET` stream open. `GET /mcp` now refreshes it when a stream opens. A `GET /mcp` whose session ID matches no session now gets a JSON-RPC 404 ("Session not found or expired"), so the client starts a new session, as the MCP specification requires; before, Streamable HTTP clients got the 400 meant for legacy SSE clients. A "session not found" 404, on `GET` or `POST`, no longer counts as a failed authentication attempt, so a client retrying an expired session cannot use up the auth rate limit (`AUTH_RATE_LIMIT_MAX`) for its IP. A stream held open longer than `SESSION_TIMEOUT_MINUTES` without any other request can still be cleaned up. Contributed in #595.
+
+### Documentation
+
+- **Kiro setup guide** ([#481](https://github.com/czlonkowski/n8n-mcp/issues/481)). `docs/KIRO_SETUP.md` covers the Kiro IDE and CLI configuration files, the n8n management tools with `${N8N_API_KEY}` expansion, connection checks and troubleshooting. Contributed in #1182.
+
+## [2.101.1] - 2026-11-06
+
+### Security
+
+- Fix incomplete IPv4 host normalisation in URL validation (GHSA-gwj8-fp64-q94q). Found in an internal security review.
+- Fix missed redaction of some API key formats in telemetry (GHSA-68rj-xv59-f2ch). Found in an internal security review.
+
+## [2.101.0] - 2026-11-03
+
+### Changed
+
+- **Updated n8n to 2.46.x.** n8n-nodes-base, n8n-core, n8n-workflow and @n8n/n8n-nodes-langchain → 2.46.4 (from 2.45.6, n8n-workflow from 2.45.4; n8n 2.46.4 is the npm `stable` release, 2.47.0 is `beta`). Rebuilt the node database: 3,434 nodes (842 core: 708 from n8n-nodes-base, 134 from @n8n/n8n-nodes-langchain; 2,592 community, 2,164 verified). New default versions: Edit Image 2, and 1.4 for the vector store nodes (Azure AI Search, ChromaDB, Databricks, In-Memory, Milvus, MongoDB Atlas, Oracle, PGVector, Pinecone, Qdrant, Redis, Supabase, Weaviate, Zep and the Chat Hub vector stores). `node_versions` has 674 rows (656 before). The community node refresh saved 116 node rows from 62 npm packages. 2,578 of 2,592 community nodes have an AI summary; the other 14 come from packages without a README. The database is 75.7 MiB.
+- **n8n-nodes-base 2.46 lists the Linux musl builds of `@napi-rs/canvas` and `@napi-rs/image` as regular dependencies**, so `npm install` failed with `EBADPLATFORM` on macOS and glibc Linux (n8n-io/n8n#43006). `package.json` overrides them with an empty package, as it already does for `isolated-vm`. The override applies to the whole dependency tree, so a full install on a musl system such as Alpine also gets no canvas or image binaries; the Docker build stages only compile TypeScript, and loading node descriptions does not need them. The published npm package is built from `package.runtime.json`, which has no n8n packages, so `npx n8n-mcp` is not affected. The fresh-install CI check copies the overrides into its test project, because npm applies them only from the root project.
+- **New workflow setting `redactCallerExecutions`** (boolean, n8n 2.46): whether a workflow that calls this one as a sub-workflow has its executions redacted too. It is in the settings table and the settings schema, so writes keep it. n8n drops a change to it, and to `redactionPolicy`, without an error unless the instance has the Data Redaction license and the API key has the `workflow:enableRedaction` or `workflow:disableRedaction` scope.
+- **`engineType` is in the Public API write schema since n8n 2.46**, documented as ignored on create and update. It stays stripped from every write, because instances from 2.36 to 2.45 reject it. It is no longer marked entity-only, and `check-settings-drift.ts` takes the settings table as a parameter so its tests keep modelling n8n 2.36.
+- **Agents: Azure OpenAI credentials.** n8n 2.46 accepts `azureOpenAiApi` and `azureEntraCognitiveServicesOAuth2Api` credentials for agents when their Endpoint Type is Foundry; Classic endpoints are still rejected. The `n8n_manage_agents` hint for these credential types and the tool documentation now name that condition; for `aws` credentials the hint still says the runtime rejects them.
+- **n8n 2.46 contract check.** Apart from the two settings above, the workflow write contract is unchanged. Node `createdAt`/`updatedAt` left the workflow response schemas; the update path does not read them. The promotion endpoints moved from `/promotions/connections` to `/promotions/environments`, and `GET /workflows/{id}/dependencies`, `GET /credentials/{id}/dependencies` and `GET /data-tables/{id}/dependencies` are new; n8n-mcp uses none of them. n8n's MCP server has the same tools. Workflow create, partial update, full update and delete were checked against an n8n 2.46.4 instance.
+- **Dependency updates.** `tslib` 2.9.1 and `tldts` 7.4.19 from the open Dependabot pull requests. `github/gh-aw-actions/setup` stays at 0.68.3: the 1.0.1 bundle no longer ships scripts that the compiled issue-triage workflow calls, so that bump needs the workflow recompiled with a matching gh-aw version. `@axe-core/playwright` stays at 4.13.0, because 4.14.0 requires Node 22.12 and the UI apps still support Node 20. Dependabot's `@anthropic-ai/sdk` 0.115.0 → 0.27.3 is a downgrade and was left out.
+
+## [2.100.0] - 2026-11-02
+
+### Changed
+
+- **Updated n8n to 2.45.x.** n8n-nodes-base, n8n-core and @n8n/n8n-nodes-langchain 2.44.3 → 2.45.6, n8n-workflow 2.44.2 → 2.45.4 (n8n 2.45.7 is the npm `stable` release; 2.46.x is still `beta`). Rebuilt the node database: 3,430 nodes (842 core: 708 from n8n-nodes-base, 134 from @n8n/n8n-nodes-langchain; 2,588 community, 2,163 verified). New core node: Databricks Lakebase Chat Memory. New default versions: Kafka, Kafka Trigger and the Kafka tool 2, Monday.com and its tool 2, Postgres and its tool 2.8, Convert to File 1.2. `node_versions` has 656 rows (651 before). The community node refresh saved 105 node rows from 61 npm packages and removed 8 rows that their packages no longer declare. 2,574 of 2,588 community nodes have an AI summary; the other 14 come from packages without a README. The database is 71.3 MiB.
+- **n8n 2.45 contract check.** The workflow write contract is unchanged: same top-level fields, the same 17 settings and the same 22 node fields. The Public API spec no longer publishes the `workflowSettings` and `node` schemas by name; they are written out inside each endpoint. `check-settings-drift.ts` searched for those names and stopped `npm run update:n8n`. It now parses the spec with `js-yaml`, resolves `$ref`s and reads the union of every copy: the named schema when there is one and the `POST /workflows` and `PUT /workflows/{id}` request bodies. The copies can disagree. In 2.44 the request bodies already accepted the node field `extendsCredential` (since 2.42), but the named `node` schema the check read did not list it. n8n 2.45.7 accepts that field but neither stores nor returns it, and instances older than 2.42 reject it, so the node write allowlist keeps stripping it. The check lists it as deliberately ignored. Other Public API changes need no action: an optional `Idempotency-Key` header on POST endpoints, `includeParentFolder` on `GET /workflows`, and a read-only `parentFolder` object on `GET /workflows/{id}`, which the update path already drops. API keys with the member role now see only their own projects' executions. n8n's MCP server adds five skill tools behind the agents skills hub flag; the agent tools have the same inputs. Agent model providers are unchanged. Workflow create, read-modify-write update and delete, executions, tags and data tables were checked against an n8n 2.45.7 instance.
+- **Dependency updates.** Patch and minor updates from the open Dependabot pull requests: `axios` 1.21.0, `sql.js` 1.15.2, `acorn` 8.19.0, `hono` 4.13.16, `jose` 6.2.15, `body-parser` 2.4.0, `follow-redirects` 1.16.2, `fast-uri` 3.1.9, `langsmith` 0.11.7, `rollup` 4.67.4, the AWS SDK clients, plus `react` 19.3.1, `vite` 8.3.5 and `vite-plugin-singlefile` 2.3.4 in the UI apps. `@axe-core/playwright` stays at 4.13.0, because 4.14.0 requires Node 22.12 and the UI apps still support Node 20. Dependabot's `@anthropic-ai/sdk` 0.115.0 → 0.27.3 is a downgrade and was left out. The major updates (`gh-aw` actions 1.0, `vitest` 5, `@vitest/coverage-v8` 5, `secretlint` 13, `@modelcontextprotocol/ext-apps` 2, `typescript` 7) are not included.
+
 ## [2.99.2] - 2026-10-27
 
 ### Security
