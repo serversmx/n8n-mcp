@@ -2,12 +2,16 @@ import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { describe, it, expect } from 'vitest';
 import {
-  diffSettingsProperties,
+  diffSettingsProperties as diffSettingsPropertiesFor,
   parseEntitySettingsProperties,
   parseSchemaProperties,
   diffNodeProperties,
 } from '../../../scripts/check-settings-drift';
-import { WORKFLOW_SETTINGS_PROPERTIES } from '../../../src/constants/workflow-settings';
+import {
+  WORKFLOW_SETTINGS_PROPERTIES,
+  type SettingsVersion,
+  type WorkflowSettingProperty,
+} from '../../../src/constants/workflow-settings';
 
 /**
  * The drift check reads n8n's OpenAPI schema with a small hand-rolled parser rather than a YAML
@@ -81,6 +85,143 @@ describe('check-settings-drift parseSchemaProperties', () => {
   it('throws on a response that is not the schema at all', () => {
     expect(() => parseSchemaProperties('')).toThrow();
     expect(() => parseSchemaProperties('<!doctype html><html>404</html>')).toThrow();
+  });
+
+  // n8n 2.45 no longer publishes workflowSettings/node by name; both are inlined in the
+  // POST /workflows request body, and the check must still read them.
+  describe('schemas inlined in POST /workflows', () => {
+    const inlined = [
+      'openapi: 3.0.0',
+      'components:',
+      '  schemas:',
+      '    tag:',
+      '      type: object',
+      '      properties:',
+      '        name:',
+      '          type: string',
+      'paths:',
+      '  /workflows:',
+      '    post:',
+      '      requestBody:',
+      '        content:',
+      '          application/json:',
+      '            schema:',
+      '              type: object',
+      '              properties:',
+      '                settings:',
+      '                  type: object',
+      '                  additionalProperties: false',
+      '                  properties:',
+      '                    timezone:',
+      '                      type: string',
+      '                    executionOrder:',
+      '                      type: string',
+      '                nodes:',
+      '                  type: array',
+      '                  items:',
+      '                    type: object',
+      '                    properties:',
+      '                      id:',
+      '                        type: string',
+      '                      createdAt:',
+      '                        type: string',
+      '                        readOnly: true',
+      '                      tags:',
+      '                        $ref: "#/components/schemas/tag"',
+    ].join('\n');
+
+    it('reads the settings schema from the request body', () => {
+      expect([...parseSchemaProperties(inlined)]).toEqual(['timezone', 'executionOrder']);
+    });
+
+    it('reads the node schema from nodes.items, keeping readOnly flags', () => {
+      const readOnly = new Set<string>();
+      expect([...parseSchemaProperties(inlined, 'node', readOnly)]).toEqual([
+        'id',
+        'createdAt',
+        'tags',
+      ]);
+      expect([...readOnly]).toEqual(['createdAt']);
+    });
+
+    it('reads the union of the named schema and the request bodies', () => {
+      // n8n 2.44 shape: a stale named copy alongside a body copy with an extra field, plus a
+      // PUT body that lists one more. A field in any copy must be reported.
+      const yaml = [
+        'components:',
+        '  schemas:',
+        '    workflowSettings:',
+        '      properties:',
+        '        timezone:',
+        '          type: string',
+        'paths:',
+        '  /workflows:',
+        '    post:',
+        '      requestBody:',
+        '        content:',
+        '          application/json:',
+        '            schema:',
+        '              properties:',
+        '                settings:',
+        '                  properties:',
+        '                    timezone:',
+        '                      type: string',
+        '                    executionOrder:',
+        '                      type: string',
+        '  /workflows/{workflowId}:',
+        '    put:',
+        '      requestBody:',
+        '        content:',
+        '          application/json:',
+        '            schema:',
+        '              properties:',
+        '                settings:',
+        '                  properties:',
+        '                    putOnly:',
+        '                      type: string',
+      ].join('\n');
+
+      expect([...parseSchemaProperties(yaml)].sort()).toEqual(['executionOrder', 'putOnly', 'timezone']);
+    });
+
+    it('treats readOnly next to a $ref as read-only, and writable in any copy as writable', () => {
+      const yaml = [
+        'components:',
+        '  schemas:',
+        '    stamp:',
+        '      type: string',
+        '    node:',
+        '      properties:',
+        '        createdAt:',
+        '          $ref: "#/components/schemas/stamp"',
+        '          readOnly: true',
+        '        updatedAt:',
+        '          type: string',
+        '          readOnly: true',
+        'paths:',
+        '  /workflows:',
+        '    post:',
+        '      requestBody:',
+        '        content:',
+        '          application/json:',
+        '            schema:',
+        '              properties:',
+        '                nodes:',
+        '                  items:',
+        '                    properties:',
+        '                      updatedAt:',
+        '                        type: string',
+      ].join('\n');
+
+      const readOnly = new Set<string>();
+      parseSchemaProperties(yaml, 'node', readOnly);
+      expect([...readOnly]).toEqual(['createdAt']);
+    });
+
+    it('still throws when neither a named nor an inline schema exists', () => {
+      const yaml = 'openapi: 3.0.0\npaths:\n  /workflows:\n    get: {}\n';
+      expect(() => parseSchemaProperties(yaml)).toThrow(/workflowSettings/);
+    });
   });
 });
 
@@ -275,9 +416,21 @@ describe('check-settings-drift parseEntitySettingsProperties', () => {
  */
 describe('check-settings-drift diffSettingsProperties', () => {
   const v236 = { major: 2, minor: 36, patch: 4 };
+  // Our table as it stood for n8n 2.36-2.45, when engineType was persisted but unpublished.
+  // n8n 2.46 published it, so the real table no longer carries an entity-only property.
+  const tableOf236: Record<string, WorkflowSettingProperty> = Object.fromEntries(
+    Object.entries(WORKFLOW_SETTINGS_PROPERTIES)
+      .filter(([name]) => name !== 'redactCallerExecutions')
+      .map(([name, meta]) => [name, name === 'engineType' ? { ...meta, entityOnly: true as const } : meta])
+  );
+  const diffSettingsProperties = (
+    schema: Set<string>,
+    entity: Set<string> | null,
+    target: SettingsVersion
+  ) => diffSettingsPropertiesFor(schema, entity, target, tableOf236);
   // The published schema of n8n 2.36 as the table models it: everything except derived-only keys
   const schemaOf236 = new Set(
-    Object.entries(WORKFLOW_SETTINGS_PROPERTIES)
+    Object.entries(tableOf236)
       .filter(([, meta]) => !meta.entityOnly)
       .map(([name]) => name)
   );
@@ -291,6 +444,19 @@ describe('check-settings-drift diffSettingsProperties', () => {
     expect(drift.unhandledEntityOnly).toEqual([]);
     expect(drift.publishedEntityOnly).toEqual([]);
     expect(drift.entityOnly).toEqual(['engineType']);
+  });
+
+  it('reports no drift for the shipped table against an n8n 2.46 shaped schema', () => {
+    // n8n 2.46 publishes engineType (ignored on write) and adds redactCallerExecutions, so
+    // schema and entity both carry every property of the real table.
+    const all = new Set(Object.keys(WORKFLOW_SETTINGS_PROPERTIES));
+    const drift = diffSettingsPropertiesFor(all, all, { major: 2, minor: 46, patch: 4 });
+
+    expect(drift).toEqual({
+      missing: [], removed: [], ahead: [], entityOnly: [], unhandledEntityOnly: [], publishedEntityOnly: [],
+    });
+    expect(WORKFLOW_SETTINGS_PROPERTIES.engineType).toMatchObject({ derived: true });
+    expect(WORKFLOW_SETTINGS_PROPERTIES.engineType.entityOnly).toBeUndefined();
   });
 
   it('flags an entity property the schema rejects and the table does not strip', () => {
@@ -407,6 +573,14 @@ describe('check-settings-drift diffNodeProperties', () => {
     expect(drift.removed).not.toContain('id');
     expect(drift.removed).not.toContain('createdAt');
     expect(drift.removed).not.toContain('credentials');
+  });
+
+  it('does not report a property we strip on purpose', () => {
+    const drift = diffNodeProperties(
+      nodeSchema(['        id:', '          type: string', '        extendsCredential:', '          type: string'])
+    );
+
+    expect(drift.missing).toEqual([]);
   });
 
   it('reports a property we send that the schema no longer lists', () => {
