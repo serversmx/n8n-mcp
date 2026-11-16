@@ -35,7 +35,11 @@ export default defineConfig({
       forks: {
         singleFork: process.env.TEST_PARALLEL !== 'true',
         maxForks: parseInt(process.env.TEST_MAX_WORKERS || '4', 10),
-        minForks: 1
+        minForks: 1,
+        // A forked worker runs on the process main thread with V8's default ~1 MB stack, while upstream's
+        // 'threads' pool gives each worker ~4 MB. Match it so deep-nesting tests (e.g. the WorkflowSanitizer
+        // 3000-level chain) behave as upstream; 4 MB stays well inside the 8 MB main-thread stack on Linux/macOS.
+        execArgv: ['--stack-size=4096']
       }
     },
     // No retries - flaky tests should be fixed, not masked
